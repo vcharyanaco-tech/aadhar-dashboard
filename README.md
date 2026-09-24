@@ -19,14 +19,18 @@ It is deployed alongside the India Post Haryana dashboard static site (see the
 
 | Path | What it is |
 | --- | --- |
-| `aadhar.html` | The Aadhaar MIS Dashboard login page (Haryana Circle). Same layout, styling and behaviour as the Tamilnadu portal, rebranded for Haryana Circle. |
+| `aadhar.html` | The Aadhaar MIS Dashboard (Haryana Circle): PIN login view + post-login MIS dashboard in one page. Same layout and look as the Tamilnadu portal, rebranded for Haryana Circle. |
 
 ## Behaviour
 
-- The page is a faithful copy of the original portal: a password-style PIN entry that
-  submits via `POST /login`.
-- The `/login` endpoint is wired to the dashboardharyana.site infrastructure when the
-  backend is connected; until then the page renders exactly like the original.
+- Faithful copy of the original portal: a password-style PIN entry on a
+  `POST /login` form.
+- A single configurable PIN (`var ACCESS_PIN` at the bottom of the file, default
+  `0000`) unlocks the post-login MIS dashboard (11 reports, 4 access levels,
+  Excel/PDF/PNG exports). Wrong PIN shows the same
+  *"Incorrect PIN. Please contact Circle Office, Haryana."* error as the original.
+- The login is currently gated client-side; wire a server-side `/login` endpoint
+  into the dashboardharyana.site backend when going live.
 
 ## Deploy
 

@@ -33,11 +33,9 @@ Snapshot of the `aadhar-dashboard` project as of 2026-09-24.
 ## How auth works today (client-side gate)
 
 `aadhar.html` keeps the faithful login card (`POST /login`, PIN field, pills). On
-submit a small inline script checks the PIN against a single configurable constant:
-
-```js
-var ACCESS_PIN = '0000';   // <-- change this before going live
-```
+submit a small inline script checks the PIN against a single configurable constant
+(`var ACCESS_PIN` near the bottom of the file). The PIN now matches the
+doptnaadhar online portal PIN.
 
 - Correct PIN → login view is hidden, the MIS dashboard is shown, and the session
   is remembered in `sessionStorage` (refresh keeps you in, mirroring the TN
@@ -48,10 +46,16 @@ var ACCESS_PIN = '0000';   // <-- change this before going live
 
 ## Pending (user to decide later)
 
-1. **Secure the `/login` endpoint backend.** The client-side gate is a placeholder
-   until the dashboardharyana.site Cloudflare Worker / Node backend is wired to
-   accept `POST /login` and validate the PIN server-side. When that happens, remove
-   `ACCESS_PIN` from `aadhar.html` and POST as the original does.
-2. **Set the real PIN** (replace the `0000` default) and decide whether a single
-   PIN covers all 4 access levels or each role gets its own PIN.
-3. Keep `aadhar.html` in sync between this repo and `dash-site` root on updates.
+1. **Move `/login` server-side.** The client-side gate is a placeholder: the PIN is
+   readable in the page source of a public site, and it is the same PIN as the live
+   doptnaadhar portal. Before real data is shown, wire the dashboardharyana.site
+   Cloudflare Worker / Node backend to accept `POST /login` (`application/x-www-form-urlencoded`,
+   field `pin`) and validate the PIN there, then remove `ACCESS_PIN` from
+   `aadhar.html` and POST as the original does.
+2. **Access levels.** Decide whether the single PIN covers all 4 access levels or
+   each role (Circle/Regional/Division Admin, Operator) gets its own PIN. The
+   dashboard already renders the 4 role cards.
+3. **Model data.** The KPI figures are Anima sample values — replace with real
+   Haryana Circle numbers once data is available (Anima's own suggestion: connect
+   to real data sources).
+4. Keep `aadhar.html` in sync between this repo and `dash-site` root on updates.

@@ -59,3 +59,14 @@ doptnaadhar online portal PIN.
    Haryana Circle numbers once data is available (Anima's own suggestion: connect
    to real data sources).
 4. Keep `aadhar.html` in sync between this repo and `dash-site` root on updates.
+
+## React app added (2026-09-24)
+
+- `src/` holds a Vite React + TypeScript + Tailwind SPA rebuild of the Anima
+  playground (Tamilnadu Circle): `/` login (PIN `1122` via `localStorage`) and
+  `/dashboard` (11 reports, access levels, sample data table, Excel/PDF/PNG
+  export stubs, mobile sidebar).
+- Anima won't export the project/db without a Pro account, and the saved capture
+  contains only the rendered DOM (no recoverable TSX), so the app is implemented
+  from the spec with hardcoded sample data (`Dashboard.tsx`: `REPORTS`, `STATS`,
+  `TABLE_ROWS`). Wire those to a real backend later.

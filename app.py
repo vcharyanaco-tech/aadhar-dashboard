@@ -944,7 +944,12 @@ def users_tab():
             flash(f"User '{target}' deleted.")
 
 
-def build_stations(ids):
+@st.cache_data(show_spinner=False, ttl=300)
+def _build_stations_cached(ids, sig):
+    return _build_stations_uncached(ids)
+
+
+def _build_stations_uncached(ids):
     """Station-wise totals for the selected upload ids, joined with the master sheet."""
     m = read_sql("SELECT * FROM master")
     for c in ("sub_division", "address", "district"):
@@ -977,8 +982,74 @@ def build_stations(ids):
     return agg, m[~m["key"].isin(agg["key"])], m
 
 
+def _data_signature():
+    """Cheap fingerprint of the tables build_stations reads.
+
+    Cached aggregations must not go stale after an upload, so the cache key
+    carries this. One COUNT per table is far cheaper than the groupby+merge it
+    guards against. Columns are probed dynamically because `master` has no
+    upload_id, only `tx` does.
+    """
+    parts = []
+    for t in ("master", "tx"):
+        if not table_exists(t):
+            parts.append(f"{t}:0")
+            continue
+        cols = {r[1] for r in run(f"PRAGMA table_info({t})", many=True)}
+        if "upload_id" in cols:
+            row = run(f"SELECT COUNT(*), COALESCE(MAX(upload_id), 0) FROM {t}", one=True)
+            parts.append(f"{t}:{row[0]}:{row[1]}")
+        else:
+            parts.append(f"{t}:{run(f'SELECT COUNT(*) FROM {t}', one=True)[0]}")
+    parts.append(f"uploads:{run('SELECT COUNT(*) FROM uploads', one=True)[0]}")
+    return "|".join(parts)
+
+
+def build_stations(ids):
+    return _build_stations_cached(tuple(ids), _data_signature())
+
+
 REPORT_COLS = ["Division Name", "Sub Division Name", "Total Transactions", "New Enrollments", "MBU",
                "Demographic Updates", "Non-MBU Biometric Updates"]
+
+
+@st.cache_data(show_spinner=False, max_entries=8, ttl=300)
+def _report_excel(out):
+    """Build the downloadable report workbook.
+
+    Cached because the previous version constructed the entire workbook - openpyxl
+    writer, per-column width scan over every cell, font styling - on every single
+    rerun, including reruns triggered by unrelated widgets and by the user never
+    clicking Download at all.
+    """
+    from openpyxl.styles import Font
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        out.to_excel(w, index=False, sheet_name="Report")
+        ws = w.sheets["Report"]
+        for i, c in enumerate(out.columns, 1):
+            ws.column_dimensions[chr(64 + i)].width = max(len(c), int(out[c].astype(str).str.len().max())) + 3
+        for cell in ws[1] + ws[ws.max_row]:
+            cell.font = Font(bold=True)
+    return buf.getvalue()
+
+
+@st.cache_data(show_spinner=False, max_entries=8, ttl=300)
+def _division_consolidated_excel(out2):
+    """Cached for the same reason as _report_excel: it used to rebuild a whole
+    workbook on every rerun just to populate a download button."""
+    from openpyxl.styles import Font
+
+    buf2 = BytesIO()
+    with pd.ExcelWriter(buf2, engine="openpyxl") as w:
+        out2.to_excel(w, index=False, sheet_name="Division Consolidated")
+        ws2 = w.sheets["Division Consolidated"]
+        for i, c in enumerate(out2.columns, 1):
+            ws2.column_dimensions[chr(64 + i)].width = max(len(c), int(out2[c].astype(str).str.len().max())) + 3
+        for cell in ws2[1] + ws2[ws2.max_row]:
+            cell.font = Font(bold=True)
+    return buf2.getvalue()
 
 
 def report_tab():
@@ -1044,16 +1115,9 @@ def report_tab():
                "Non-MBU Biometric Updates. When several days are selected, their figures are added together.")
     st.dataframe(out, hide_index=True, width="stretch")
 
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        out.to_excel(w, index=False, sheet_name="Report")
-        ws = w.sheets["Report"]
-        for i, c in enumerate(out.columns, 1):
-            ws.column_dimensions[chr(64 + i)].width = max(len(c), int(out[c].astype(str).str.len().max())) + 3
-        for cell in ws[1] + ws[ws.max_row]:
-            cell.font = Font(bold=True)
+    buf = _report_excel(out)
     a, b = st.columns(2)
-    a.download_button("Download Excel", buf.getvalue(), "haryana_circle_report.xlsx",
+    a.download_button("Download Excel", buf, "haryana_circle_report.xlsx",
                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     b.download_button("Download CSV", out.to_csv(index=False).encode("utf-8-sig"), "haryana_circle_report.csv",
                       "text/csv")
@@ -1070,16 +1134,9 @@ def report_tab():
     out2 = pd.concat([cons, grand2], ignore_index=True)
     st.dataframe(out2, hide_index=True, width="stretch")
 
-    buf2 = BytesIO()
-    with pd.ExcelWriter(buf2, engine="openpyxl") as w:
-        out2.to_excel(w, index=False, sheet_name="Division Consolidated")
-        ws2 = w.sheets["Division Consolidated"]
-        for i, c in enumerate(out2.columns, 1):
-            ws2.column_dimensions[chr(64 + i)].width = max(len(c), int(out2[c].astype(str).str.len().max())) + 3
-        for cell in ws2[1] + ws2[ws2.max_row]:
-            cell.font = Font(bold=True)
+    buf2 = _division_consolidated_excel(out2)
     c1, c2 = st.columns(2)
-    c1.download_button("Download Division-wise Excel", buf2.getvalue(), "haryana_circle_division_consolidated.xlsx",
+    c1.download_button("Download Division-wise Excel", buf2, "haryana_circle_division_consolidated.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     c2.download_button("Download Division-wise CSV", out2.to_csv(index=False).encode("utf-8-sig"),
                        "haryana_circle_division_consolidated.csv", "text/csv")
@@ -1221,15 +1278,26 @@ if st.session_state["user"].get("must_change"):
 sidebar()
 st.title(APP_NAME)
 names = ["Dashboard", "Report", "Camps"] + (["Upload data", "Manage users"] if is_admin() else [])
-tabs = st.tabs(names)
-with tabs[0]:
+# A segmented control rather than st.tabs, because st.tabs executes the body of
+# EVERY tab on every rerun. That meant each interaction re-ran the dashboard
+# groupby, the report's two Excel workbooks and the camps and users queries -
+# on a free-plan CPU with none of it visible. Only the selected view runs now.
+#
+# The persisted key can hold a view this user may not see (an admin-only tab
+# left over from a previous login), so fall back to a throwaway key rather than
+# writing session_state after the widget exists, which Streamlit forbids.
+stored = st.session_state.get("main_view")
+view_key = "main_view" if stored in names else "main_view_reset"
+view = st.segmented_control("View", names, default=names[0], label_visibility="collapsed",
+                            key=view_key) or names[0]
+
+if view == "Dashboard":
     dashboard()
-with tabs[1]:
+elif view == "Report":
     report_tab()
-with tabs[2]:
+elif view == "Camps":
     camps_tab()
-if is_admin():
-    with tabs[3]:
-        upload_tab()
-    with tabs[4]:
-        users_tab()
+elif view == "Upload data":
+    upload_tab()
+elif view == "Manage users":
+    users_tab()

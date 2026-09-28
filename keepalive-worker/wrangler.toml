@@ -1,0 +1,32 @@
+name = "aadhar-keepalive"
+main = "worker.js"
+account_id = "606780bc6c3ecd48289472c73d27a982"
+compatibility_date = "2026-08-04"
+
+# Machine-to-machine only, like aadhar-backup. No custom route: this pings
+# Render, it is never pinged by anything but its own /status check.
+#
+# Lives in the same dedicated account as the backup bridge so the two pieces of
+# operational infrastructure for this dashboard are not coupled to dash-site.
+
+[observability]
+enabled = true
+
+# Every 10 minutes, matching the cadence the dash-site worker uses for the Node
+# backend. The handler itself skips 21:00-06:00 IST.
+[triggers]
+crons = ["*/10 * * * *"]
+
+[vars]
+# Health path, which includes the base path from .streamlit/config.toml.
+AADHAR_HEALTH_PATH = "/aadhar-dashboard/_stcore/health"
+# A cold start can outlast one attempt, so allow a generous per-attempt budget.
+KEEPALIVE_TIMEOUT_MS = "20000"
+
+# AADHAR_ORIGIN is a secret, not a var, so the Render URL is not in the repo:
+#   wrangler secret put AADHAR_ORIGIN
+# Until it is set, /status reports configured:false and the cron no-ops loudly.
+
+[[kv_namespaces]]
+binding = "STATUS"
+id = "5ec6604fe3d5402e8d4d9d4394445f9c"

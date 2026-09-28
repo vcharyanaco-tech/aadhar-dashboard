@@ -47,6 +47,9 @@ MAX_FAILS, LOCK_MINUTES = 5, 5
 # the Circle's standard password; when it is unset a random password is
 # generated per batch instead of falling back to a shared default.
 DEFAULT_TEMP_PASSWORD = os.environ.get("AADHAR_DEFAULT_TEMP_PASSWORD") or ""
+# Idle logout in minutes. 0 disables it. Long enough not to interrupt a user
+# mid-report, short enough that an unattended station is not still signed in.
+SESSION_TIMEOUT_MINUTES = int(float(os.environ.get("SESSION_TIMEOUT_MINUTES") or 30))
 APP_NAME = "HARYANA CIRCLE AADHAR MONITORING DASHBOARD"
 # Put the India Post logo in the same folder as app.py and name it logo.png (or logo.jpg)
 LOGO = next((p for n in ("logo.png", "logo.jpg", "logo.jpeg", "logo.webp")
@@ -320,11 +323,10 @@ def clear_report_cache():
     deliberately do not clear this. The TTL is a safety net, not the mechanism:
     an admin uploading a sheet should see it immediately, not after five minutes.
     """
-    for fn in (build_stations, build_operators):
-        try:
-            fn.clear()
-        except Exception:
-            pass
+    try:
+        build_period.clear()
+    except Exception:
+        pass
 
 
 def save_operator_master(m):
@@ -439,6 +441,7 @@ def login_screen():
             user, err = authenticate(u, p)
             if user:
                 st.session_state["user"] = user
+                st.session_state["last_seen"] = datetime.now()
                 st.rerun()
             st.error(err)
     st.markdown('<div class="hp-pills"><div class="hp-pill">Live Dashboard</div>'
@@ -505,7 +508,7 @@ def dashboard():
     if not ids:
         return
 
-    agg, missing, m = build_stations(ids)
+    agg, missing, m, _ = build_period(ids)
 
     f1, f2, f3 = st.columns([1, 1, 2])
     dv = f1.selectbox("Division", ["All"] + sorted(set(agg["division"]) | set(m["division"])))
@@ -596,7 +599,7 @@ def operator_analysis_tab():
     if not ids:
         return
 
-    ops = build_operators(ids)
+    _, _, _, ops = build_period(ids)
     if ops.empty:
         st.info("No operator data found for the selected period. Make sure the daily upload file has "
                 "a Session Operator ID (or Operator ID) column.")
@@ -873,33 +876,50 @@ _STATION_TX_COLS = ["key", "station", "district", "address", "t_div", "t_sub", "
 _MASTER_COLS = ["key", "station", "office_id", "division", "sub_division", "address", "district"]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def build_stations(ids):
-    """Station-wise totals for the selected upload ids, joined with the master sheet.
+OPERATOR_EMPTY_COLS = ["operator", "operator_name", "division", "sub_division", "stations",
+                       "days_worked", "enr", "mbu", "demo", "nonmbu", "upd", "total"]
 
-    Cached because this runs on every rerun of every report page and reads the
-    whole transaction history for the period. `ids` is passed as a tuple so the
-    cache key is hashable. Call `clear_report_cache()` after any write that
-    changes master/transaction data.
+
+@st.cache_data(ttl=300, show_spinner=False)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def build_period(ids):
+    """Everything the report pages need for a set of uploads, from one read of each table.
+
+    Returns (station_totals, master_without_data, master, operator_totals).
+
+    Station and operator figures are two different aggregations of the same rows,
+    so they are computed together from a single pass. Previously build_operators
+    called build_stations *and* re-read tx, which made one Report render issue
+    three heavy queries (1 master + 2 tx) instead of two.
+
+    Cached because it runs on every rerun of every report page. `ids` is passed
+    as a tuple so the cache key is hashable; call `clear_report_cache()` after any
+    write that changes master or transaction data.
     """
     ids = tuple(ids)
     m = read_sql(f"SELECT {', '.join(_MASTER_COLS)} FROM master")
     for c in ("sub_division", "address", "district"):
         if c not in m.columns:
             m[c] = ""
+
     placeholders = ",".join("?" * len(ids))
-    t = read_sql(f"SELECT {', '.join(_STATION_TX_COLS)} FROM tx "
+    t = read_sql(f"SELECT {', '.join(_STATION_TX_COLS)}, operator FROM tx "
                  f"WHERE upload_id IN ({placeholders})", ids)
     for c in ("mbu", "demo", "nonmbu", "enr", "upd"):
         t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0) if c in t.columns else 0.0
     for c in ("t_div", "t_sub", "address", "district"):
         t[c] = t[c].fillna("").astype(str) if c in t.columns else ""
+
     if t.empty:
-        agg = pd.DataFrame(columns=["key", "station", "district", "address", "t_div", "t_sub",
-                                    "machines", "days_reported", "enr", "mbu", "demo", "nonmbu",
-                                    "upd", "total", "office_id", "division", "sub_division",
-                                    "m_addr", "m_dist"])
-        return agg, m, m
+        empty_stations = pd.DataFrame(columns=["key", "station", "district", "address", "t_div", "t_sub",
+                                               "machines", "days_reported", "enr", "mbu", "demo",
+                                               "nonmbu", "upd", "total", "office_id", "division",
+                                               "sub_division", "m_addr", "m_dist"])
+        return empty_stations, m, m, pd.DataFrame(columns=OPERATOR_EMPTY_COLS)
+
+    # ---- station totals
     agg = t.groupby("key", as_index=False).agg(
         station=("station", "first"), district=("district", "first"), address=("address", "first"),
         t_div=("t_div", "first"), t_sub=("t_sub", "first"), machines=("key", "size"),
@@ -919,30 +939,28 @@ def build_stations(ids):
     agg["office_id"] = agg["office_id"].fillna("")
     agg["address"] = first_filled(agg["address"], agg["m_addr"], "")
     agg["district"] = first_filled(agg["district"], agg["m_dist"], "")
-    return agg, m[~m["key"].isin(agg["key"])], m
+    missing = m[~m["key"].isin(agg["key"])]
+
+    # ---- operator totals, from the same rows
+    ops = _aggregate_operators(t, agg)
+    return agg, missing, m, ops
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def build_operators(ids):
-    """Operator-wise totals for the selected upload ids. Each operator is mapped to the
-    division / sub-division of the stations they reported from (most frequent one)."""
-    ids = tuple(ids)
-    agg, _, _ = build_stations(ids)
-    key_div = agg.set_index("key")[["division", "sub_division"]]
+def _aggregate_operators(t, station_agg):
+    """Operator-wise totals, mapped to the division their stations belong to.
 
-    placeholders = ",".join("?" * len(ids))
-    t = read_sql(f"SELECT {', '.join(_STATION_TX_COLS)}, operator FROM tx "
-                 f"WHERE upload_id IN ({placeholders})", ids)
-    empty = pd.DataFrame(columns=["operator", "operator_name", "division", "sub_division", "stations", "days_worked",
-                                  "enr", "mbu", "demo", "nonmbu", "upd", "total"])
+    Each operator is attributed to the division / sub-division they reported
+    from most often in the period. Split out of build_period so it can be
+    tested on its own; it takes the already-read rows and never touches SQL.
+    """
+    empty = pd.DataFrame(columns=OPERATOR_EMPTY_COLS)
     if "operator" not in t.columns or t.empty:
         return empty
-    t["operator"] = t["operator"].fillna("").astype(str).str.strip()
-    t = t[t["operator"] != ""]
+    key_div = station_agg.set_index("key")[["division", "sub_division"]]
+    t = t[t["operator"].fillna("").astype(str).str.strip() != ""].copy()
     if t.empty:
         return empty
-    for c in ("mbu", "demo", "nonmbu", "enr", "upd"):
-        t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0) if c in t.columns else 0.0
+    t["operator"] = t["operator"].fillna("").astype(str).str.strip()
     t = t.join(key_div, on="key")
     t["division"] = t["division"].fillna("Not in master")
     t["sub_division"] = t["sub_division"].fillna("Not mapped")
@@ -973,7 +991,9 @@ def report_tab():
     if not ids:
         return
 
-    agg_full, missing, _ = build_stations(ids)
+    # One call gives both the station and operator aggregates from a single
+    # read of master and tx.
+    agg_full, missing, _, ops = build_period(ids)
     not_in_master = agg_full[agg_full["division"] == "Not in master"]
     st.caption(f"Stations in daily data: {len(agg_full)} | not found in master: "
                f"{len(not_in_master)} | master stations with no data: {len(missing)}")
@@ -1069,7 +1089,6 @@ def report_tab():
     st.subheader("Operator-wise Consolidated Report")
     st.caption("Each operator is grouped under the division / sub-division they reported from most often "
                "in the selected period(s), independent of the Division filter above.")
-    ops = build_operators(ids)
     if ops.empty:
         st.info("No operator data found in the selected period. Make sure the daily upload file has a "
                 "Session Operator ID (or Operator ID) column.")
@@ -1167,6 +1186,40 @@ def _since_text(iso_ts):
     return f" since {iso_ts}" if iso_ts else ""
 
 
+def _rollback_controls(gens):
+    """Restore the live database from an earlier stored generation.
+
+    This overwrites the database the app is currently serving, so it is behind a
+    typed confirmation rather than a single click. The current file is kept as
+    `aadhaar.db.pre-rollback` before anything is replaced, so a rollback taken in
+    error is itself recoverable.
+    """
+    st.divider()
+    st.markdown("**Roll back to an earlier snapshot**")
+    st.caption("Replaces the database this instance is serving with an older stored "
+               "snapshot. Everything uploaded since that snapshot will be gone from "
+               "this instance. The current file is kept as `aadhaar.db.pre-rollback`, "
+               "and the upload that caused the problem is usually re-uploadable.")
+    older = [g for g in gens if not g.get("isLatest")]
+    if not older:
+        st.info("There is only one snapshot, so there is nothing to roll back to.")
+        return
+    options = {f"{g['generation']}  ({_age_text(g['ageSeconds'])})": g["generation"] for g in older}
+    choice = st.selectbox("Snapshot to restore", list(options), key="bk_rollback_pick")
+    typed = st.text_input("Type RESTORE to enable the button", key="bk_rollback_confirm")
+    if st.button("Restore this snapshot", key="bk_rollback_now",
+                 disabled=typed.strip().upper() != "RESTORE"):
+        gen = options[choice]
+        with st.spinner(f"Restoring {gen}..."):
+            result = kv_sync.restore_generation(gen)
+        if result.get("restored"):
+            clear_report_cache()
+            st.success(f"Restored {result['bytes']:,} bytes from generation {gen}.")
+            st.rerun()
+        else:
+            st.error(f"Rollback failed: {result.get('reason')}")
+
+
 def backup_tab():
     """Admin view of whether the off-site backup is actually working.
 
@@ -1253,15 +1306,12 @@ def backup_tab():
                 "Age": _age_text(g["ageSeconds"]),
                 "Latest": "yes" if g["isLatest"] else "",
             } for g in gens]), hide_index=True, use_container_width=True)
+            _rollback_controls(gens)
         else:
             st.info("The bridge holds no snapshots yet.")
 
     st.caption("The same figures are available from a shell: `python kv_sync.py status` "
                "(or `generations`).")
-
-
-def _since_text(iso_ts):
-    return f" since {iso_ts}" if iso_ts else ""
 
 
 def camps_tab():
@@ -1345,9 +1395,26 @@ if "flash" in st.session_state:
 if not run("SELECT 1 FROM users WHERE role='admin'", one=True):
     setup_screen()
     st.stop()
+
+# Idle timeout. Streamlit reruns the whole script on every interaction, so this
+# is a reliable activity signal: an unattended browser stops touching widgets and
+# gets logged out. The point is that these are shared logins handed to divisions,
+# so a station left open stays usable by whoever walks up to it.
+_timed_out = False
+if "user" in st.session_state:
+    last_seen = st.session_state.get("last_seen")
+    if SESSION_TIMEOUT_MINUTES and last_seen and \
+            (datetime.now() - last_seen).total_seconds() > SESSION_TIMEOUT_MINUTES * 60:
+        st.session_state.clear()
+        _timed_out = True
+
 if "user" not in st.session_state:
+    if _timed_out:
+        st.info(f"You were signed out after {SESSION_TIMEOUT_MINUTES} minutes of inactivity. "
+                "Please log in again.")
     login_screen()
     st.stop()
+st.session_state["last_seen"] = datetime.now()
 if st.session_state["user"].get("must_change"):
     force_change_password_screen()
     st.stop()

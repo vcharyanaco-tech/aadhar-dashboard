@@ -38,8 +38,11 @@ still starts, so a failure degrades rather than boot-looping.
 """
 
 import atexit
+import calendar
 import json
 import os
+import re
+import shutil
 import signal
 import sqlite3
 import sys
@@ -262,6 +265,66 @@ def restore_data():
         _stats["consecutive_failures"] += 1
         _log(f"restore failed: {err}")
         return {"restored": False, "reason": str(err)}
+
+
+def restore_generation(generation, keep_backup=True):
+    """Replace the live database with a specific stored generation.
+
+    Unlike restore_data() this deliberately overwrites an existing file, which is
+    what a rollback means. It is therefore guarded three ways: the download is
+    validated before anything is touched, the current file is kept as
+    `aadhaar.db.pre-rollback`, and the caller is expected to have confirmed with a
+    human first.
+    """
+    if not enabled():
+        return {"restored": False, "reason": "disabled"}
+    if not is_valid_gen(generation):
+        return {"restored": False, "reason": "bad_generation"}
+    try:
+        raw, _ = _get(f"/db/{generation}")
+        if not raw:
+            return {"restored": False, "reason": "not_found", "generation": generation}
+        ok, detail = _validate(raw)
+        if not ok:
+            _record_failure(f"rejected generation {generation}: {detail}")
+            _log(f"rollback refused, snapshot not written ({detail})")
+            return {"restored": False, "reason": detail, "generation": generation}
+
+        backup_path = None
+        if keep_backup and DB.exists():
+            backup_path = DB.with_suffix(DB.suffix + ".pre-rollback")
+            shutil.copy2(DB, backup_path)
+
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        DB.write_bytes(raw)
+        for suffix in ("-wal", "-shm"):
+            try:
+                Path(str(DB) + suffix).unlink()
+            except OSError:
+                pass
+
+        _stats["restored"] = True
+        _stats["restored_from"] = generation
+        _stats["db_bytes"] = len(raw)
+        _stats["last_error"] = None
+        _stats["consecutive_failures"] = 0
+        _log(f"rolled back to generation {generation} ({len(raw)} bytes)"
+             + (f"; previous file kept at {backup_path.name}" if backup_path else ""))
+        return {"restored": True, "bytes": len(raw), "generation": generation,
+                "backup": str(backup_path) if backup_path else None}
+    except BridgeError as err:
+        _record_failure(str(err))
+        _log(f"rollback failed: {err}")
+        return {"restored": False, "reason": str(err), "status": err.status}
+    except Exception as err:
+        _record_failure(str(err))
+        _log(f"rollback failed: {err}")
+        return {"restored": False, "reason": str(err)}
+
+
+def is_valid_gen(generation):
+    """Match the Worker's generation ids, so a bad value never reaches a URL."""
+    return bool(generation) and bool(re.match(r"^\d{13}-[0-9a-f]{6}$", str(generation)))
 
 
 def _snapshot_bytes():
@@ -587,13 +650,21 @@ def _is_healthy(bridge, bridge_error):
 
 
 def _age(iso_ts):
+    """Seconds since a UTC 'YYYY-MM-DDTHH:MM:SSZ' timestamp, or None.
+
+    Uses calendar.timegm on an explicitly UTC struct. The obvious-looking
+    alternative - time.mktime(time.strptime(...)) - interprets the struct as
+    *local* time and then needs time.timezone subtracted, and those two disagree
+    across a DST transition, which would make every "age ago" figure in the admin
+    UI wrong by an hour twice a year.
+    """
     if not iso_ts:
         return None
     try:
-        then = time.mktime(time.strptime(iso_ts, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
-    except Exception:
+        parsed = time.strptime(iso_ts, "%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, TypeError):
         return None
-    return max(0, int(_now() - then))
+    return max(0, int(_now() - calendar.timegm(parsed)))
 
 
 def generations():

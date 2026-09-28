@@ -7,11 +7,16 @@ address = "0.0.0.0"
 # throttled free-plan CPU as the script run.
 fileWatcherType = "none"
 enableXsrfProtection = true
-enableCORS = true
-corsAllowedOrigins = [
-  "https://dashboardharyana.site",
-  "https://www.dashboardharyana.site",
-]
+
+# CORS: boot.py passes --server.enableCORS=false, and a command-line flag takes
+# precedence over this file, so anything set here is ignored in production. It is
+# left off deliberately rather than left in a stale state: this app is served
+# directly by Render, not through the Cloudflare proxy the README used to
+# describe, so there is no browser origin to allowlist. With CORS off, a
+# cross-origin browser request gets no CORS header and is blocked by the browser,
+# which is the correct posture for a directly-exposed app.
+enableCORS = false
+
 # Upload cap in MB. Kept in step with --server.maxUploadSize in boot.py: Streamlit
 # gives the command-line flag precedence, so the two must agree or the effective
 # limit depends on how the app was started.

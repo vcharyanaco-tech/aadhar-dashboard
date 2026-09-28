@@ -66,6 +66,7 @@ committed secrets.
 | `AADHAR_SYNC_MIN_INTERVAL_MS` | no | `900000` | Floor between two pushes (15 min), so a burst of edits costs one push |
 | `AADHAR_SYNC_MAX_BYTES` | no | `20971520` | Refuse to push a snapshot above this size (20 MiB; Workers KV caps a value at 25) |
 | `AADHAR_DEFAULT_TEMP_PASSWORD` | no | random per batch | Shared initial password for bulk-created division logins. Unset means a random password is generated for each batch and shown once. |
+| `SESSION_TIMEOUT_MINUTES` | no | `30` | Idle logout. `0` disables it. Streamlit reruns on every interaction, so this is a reliable activity signal. |
 
 The bridge is off unless both `AADHAR_SYNC_URL` and `AADHAR_SYNC_TOKEN` are set,
 so local development is unaffected.
@@ -86,21 +87,29 @@ things a reader of this file would otherwise assume work.
   per batch when the env var is unset, but if it is set then every division gets
   the same one. Users are forced to change it on first login.
 - **Restore is a manual admin action.** If `aadhaar.db` is lost, the app restores
-  the newest bridge snapshot automatically at boot, but there is no in-app
-  "roll back to generation X" button and no way to upload a replacement database
-  from the UI. Use `python kv_sync.py restore`, or copy the file yourself, or
-  re-upload the source spreadsheets. Full admin backup/restore tooling is not
-  built yet.
-- **Division logins can see every division's data.** Bulk creation makes one
-  login per division, but no query is scoped to the logged-in user's division, so
-  a Hisar login sees all eleven. The per-division credentials are cosmetic until
-  row-level access control exists.
+  the newest bridge snapshot automatically at boot. To go back deliberately, the
+  admin **Backup status** tab lists every retained generation and offers a
+  rollback, gated behind typing `RESTORE`; the current file is kept as
+  `aadhaar.db.pre-rollback` first. There is still no way to upload a replacement
+  database from the UI — use `python kv_sync.py restore`, copy the file yourself,
+  or re-upload the source spreadsheets.
+- **Division logins are not scoped — by design.** Bulk creation makes one login
+  per division, but no query filters by the logged-in user's division, so every
+  logged-in user sees all eleven divisions in the dashboard, the reports and the
+  operator analysis. The per-division credentials identify who is asking and give
+  a division its own `must_change` password rotation; they are **not** an
+  access-control boundary. `role` decides which *pages* load, never which *rows*
+  are returned. `tests/test_screens.py` pins this, so if scoping is ever wanted it
+  has to be written deliberately rather than assumed to exist already.
 - **There is no row-level access control at all.** Every non-admin sees the same
-  figures; `role` only decides which pages load.
-- **Nothing pings this service to keep it awake.** The `*/10` cron in the
-  dash-site Worker pings the Node backend's `/api/health`, not this Streamlit
-  service, so a Render free instance still spins down overnight. Backups survive
-  the spin-down, but the first request of the day is slow.
+  figures.
+- **The app is served directly by Render, not through Cloudflare.** The dash-site
+  Worker has no route for `/aadhar-dashboard/*` and no `AADHAR_ORIGIN` binding, so
+  `https://aadhar-dashboard.onrender.com` is the only public entry point. That
+  means no WAF, no rate limiting and no Content-Security-Policy in front of it.
+  Streamlit's own XSRF protection and the app's login are what stand between an
+  unauthenticated request and the data. Putting it behind the Worker would add
+  those, at the cost of the extra hop.
 
 ## Data
 
@@ -170,10 +179,9 @@ after a period of inactivity.
 
 `kv_sync.py` removes the first problem: a dedicated Cloudflare Worker holds a
 copy in Workers KV, so a cold start or redeploy restores the database instead of
-losing it. The second problem is handled in the dash-site Worker — its
-`*/10 * * * *` cron pings this service's `_stcore/health` endpoint during roughly
-06:00-21:00 IST and deliberately skips overnight, so the instance stays
-responsive through the working day and sleeps outside it.
+losing it. The keep-alive that holds the instance awake during the working day is the
+`aadhar-keepalive` Worker in this same repository (see below). It is not the
+dash-site cron, which only knows about the Node backend.
 
 This needs the bridge to be configured (`AADHAR_SYNC_URL` and
 `AADHAR_SYNC_TOKEN`); without it the service loses its data on every deploy. The
@@ -249,16 +257,45 @@ the only trace was one line in the boot log, and the app looked healthy while
 holding no backups at all.
 
 `.streamlit/config.toml` configures Streamlit for the reverse proxy: base path
-`aadhar-dashboard`, XSRF and CORS enabled, the two public origins allowlisted, and
-telemetry disabled. Note that `boot.py` overrides the CORS, XSRF and upload-size
-settings on the command line, so the effective values in production come from
-`boot.py`, not from this file.
+`aadhar-dashboard`, XSRF enabled, telemetry disabled, and a 15 MB upload cap.
+`boot.py` overrides CORS and the upload size on the command line, and the flag
+wins, so the effective production values come from `boot.py`.
 
-The Cloudflare Worker in `dash-site` proxies `/aadhar-dashboard/*` to the Render
-origin, which it reads from the `AADHAR_ORIGIN` secret. It forwards WebSocket
-upgrades, 308-redirects the old `/aadhar.html` and
-`/aadhar-dashboard/index.html` paths to the canonical `/aadhar-dashboard/`, and
-returns 503 while `AADHAR_ORIGIN` is unset.
+There is no Cloudflare proxy in front of this service today. The dash-site Worker
+has no `/aadhar-dashboard/*` route and no `AADHAR_ORIGIN` binding, so the Render
+URL is the public entry point.
+
+#### The keep-alive Worker
+
+`keepalive-worker/`, deployed to the same dedicated account. A Render free
+instance idles after ~15 minutes without traffic and a cold start takes 30-60s,
+so a cron pings this service's health endpoint every 10 minutes.
+
+| | |
+| --- | --- |
+| URL | `https://aadhar-keepalive.aadhar-haryana.workers.dev` |
+| Status | `GET /status` — last attempt, last success, failure count, staleness |
+| Manual ping | `GET /ping` — pings once, on demand, and reports the result |
+| Secret | `AADHAR_ORIGIN` (the Render URL; must be set, or every tick no-ops) |
+| KV namespace | `aadhar-keepalive-status` |
+
+It skips 21:00-06:00 IST so the instance sleeps overnight and banks instance-hours
+against Render's monthly free cap; the first user of the day pays a cold start.
+
+Unlike the dash-site cron, this one **records its outcome**. The old cron had no
+observable state, so "the cron is working" and "the cron is pointed at the wrong
+URL" looked identical. `/status` reports `configured: false` and
+`healthy: false` when the origin is unset, so a misconfiguration is visible in
+seconds rather than after someone complains about a slow morning.
+
+Configure it with:
+
+```
+cd keepalive-worker
+npx wrangler secret put AADHAR_ORIGIN   # the service's https://<name>.onrender.com
+npx wrangler deploy
+curl https://aadhar-keepalive.aadhar-haryana.workers.dev/status
+```
 
 ## Security notes
 
@@ -283,8 +320,10 @@ returns 503 while `AADHAR_ORIGIN` is unset.
 | `parsers.py` | Spreadsheet parsing and database persistence — pure functions over DataFrames, no Streamlit |
 | `kv_sync.py` | The off-site backup bridge client |
 | `backup-worker/` | The Cloudflare Worker that stores the snapshots |
+| `keepalive-worker/` | The Cloudflare cron that pings Render to stop the instance idling |
 | `tests/test_parsers.py` | 77 tests covering the parsing and persistence rules |
-| `tools/smoketest_backup_tab.py` | Drives the real script through Streamlit's AppTest |
+| `tests/test_screens.py` | 24 tests driving the real script through Streamlit's AppTest |
+| `tools/smoketest_backup_tab.py` | Interactive check of the admin login path and backup tab |
 
 ## Tests
 
@@ -305,8 +344,13 @@ easy to change by accident and would otherwise fail silently:
 - `quote_ident` rejects injected identifiers.
 - The report queries use the index, asserted via `EXPLAIN QUERY PLAN`.
 
-There is no coverage of the six screens; `tools/smoketest_backup_tab.py` covers
-the admin login path and the backup tab.
+`test_screens.py` drives the real script through AppTest and covers what the
+parser suite cannot: that all seven pages render for an admin, that the four
+read-only pages render for a plain user, that admin pages are absent from a
+non-admin's navigation, that a division login sees all eleven divisions, that
+active sessions are not logged out while an idle one is, and that a wrong
+password, an unknown user and a disabled account are all rejected with the same
+wording (no account enumeration).
 
 ## Notes
 
@@ -318,6 +362,8 @@ the admin login path and the backup tab.
   the two must agree or the effective limit depends on how the app was started.
 - `run()` commits only for statements that are not `SELECT`/`PRAGMA`/`WITH`, so
   reads no longer take a write lock.
-- `use_container_width` is deprecated in Streamlit 1.64 in favour of
-  `width='stretch'`. The calls still work and emit a warning; converting the
-  whole app at once was out of scope for the change that introduced the notice.
+- `build_period` computes the station and operator aggregates from a single read
+  of `master` and `tx`. They are two aggregations of the same rows, and the
+  Report page needs both, so reading `tx` twice per render was pure waste.
+- The `use_container_width` deprecation notice in Streamlit 1.64 is expected; see
+  the note below.

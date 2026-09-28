@@ -57,20 +57,30 @@ function istNow() {
 
 async function readStatus(env) {
   const raw = await env.STATUS.get(STATUS_KEY, 'text');
+  const configured = Boolean(env.AADHAR_ORIGIN);
   if (!raw) {
     return {
       ok: true,
       service: 'aadhar-keepalive',
-      configured: Boolean(env.AADHAR_ORIGIN),
+      configured,
       origin: env.AADHAR_ORIGIN || null,
       everPinged: false,
     };
   }
+  let parsed = null;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch {
-    return { ok: true, service: 'aadhar-keepalive', everPinged: false, corrupt: true };
+    parsed = null;
   }
+  if (!parsed) {
+    return { ok: true, service: 'aadhar-keepalive', configured, everPinged: false, corrupt: true };
+  }
+  // Recompute from the environment rather than trusting the stored value. A
+  // record written before AADHAR_ORIGIN was set would otherwise keep reporting
+  // configured:false forever, telling an operator to set a variable they had
+  // already set - the same silent-misconfiguration trap as before.
+  return { ...parsed, configured, origin: env.AADHAR_ORIGIN || parsed.origin || null };
 }
 
 async function ping(env) {

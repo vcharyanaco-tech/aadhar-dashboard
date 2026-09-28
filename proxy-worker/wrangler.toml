@@ -1,0 +1,28 @@
+name = "aadhar-proxy"
+main = "worker.js"
+account_id = "606780bc6c3ecd48289472c73d27a982"
+compatibility_date = "2026-08-04"
+
+# Serves the Streamlit dashboard from an edge in front of Render.
+#
+# This lives in the dedicated account, so it is reachable only on
+# aadhar-proxy.aadhar-haryana.workers.dev. Serving it from
+# dashboardharyana.site is NOT possible from here: that zone belongs to the other
+# account, where the dash-site worker already owns the hostname. Adding the
+# /aadhar-dashboard route there would mean putting this dashboard's traffic
+# through that account, which is the opposite of keeping them separate.
+#
+# AADHAR_ORIGIN is a secret, not a var, so the Render URL is not in the repo:
+#   npx wrangler secret put AADHAR_ORIGIN
+# Until it is set, every request gets a 503 explaining what to do. Requests are
+# refused rather than passed through, so a missing origin can never accidentally
+# serve the origin directly.
+
+[observability]
+enabled = true
+
+# No [limits] block: CPU limits are a paid-plan feature and declaring cpu_ms
+# fails the whole deploy on the free plan with error 100328. WebSocket streaming
+# is unaffected - it is governed by the client's timeout, not a CPU budget.
+
+# No kv_namespaces: this Worker forwards and adds headers, it stores nothing.

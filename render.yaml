@@ -15,10 +15,8 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.14.3"
-      - key: ADMIN_USERNAME
-        sync: false
-      - key: ADMIN_PASSWORD
-        sync: false
+      # No admin credentials here: the first-run setup screen creates the admin
+      # in the database. ADMIN_USERNAME / ADMIN_PASSWORD are not read by the code.
       - key: AADHAR_SYNC_URL
         value: https://dashboardharyana.site/api/backup
       - key: AADHAR_SYNC_TOKEN

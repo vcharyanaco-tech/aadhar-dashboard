@@ -9,6 +9,7 @@ Run with:
 
     .venv/Scripts/python -m pytest tests/ -q
 """
+import datetime
 import sqlite3
 
 import pandas as pd
@@ -460,6 +461,128 @@ class TestOperatorNames:
         assert names.loc["12"] == "Asha"
         assert names.loc["34"] == "Bim"
         con.close()
+
+
+# ---------------------------------------------------------------- working days
+class TestNonWorkingWeekdays:
+    def test_sunday_is_the_default(self, monkeypatch):
+        monkeypatch.delenv("AADHAR_NON_WORKING_WEEKDAYS", raising=False)
+        assert parsers.non_working_weekdays() == (6,)
+
+    def test_saturday_is_a_working_day_by_default(self, monkeypatch):
+        """Indian post offices do not close on the second Saturday."""
+        monkeypatch.delenv("AADHAR_NON_WORKING_WEEKDAYS", raising=False)
+        assert 5 not in parsers.non_working_weekdays()
+
+    def test_configurable(self, monkeypatch):
+        monkeypatch.setenv("AADHAR_NON_WORKING_WEEKDAYS", "6,0")
+        assert parsers.non_working_weekdays() == (0, 6)
+
+    def test_empty_means_no_non_working_days(self, monkeypatch):
+        monkeypatch.setenv("AADHAR_NON_WORKING_WEEKDAYS", "  ")
+        assert parsers.non_working_weekdays() == ()
+
+    def test_ignores_junk(self, monkeypatch):
+        monkeypatch.setenv("AADHAR_NON_WORKING_WEEKDAYS", "sunday,6,99,-1,,")
+        assert parsers.non_working_weekdays() == (6,)
+
+    def test_deduplicates(self, monkeypatch):
+        monkeypatch.setenv("AADHAR_NON_WORKING_WEEKDAYS", "6,6,6")
+        assert parsers.non_working_weekdays() == (6,)
+
+
+class TestSplitWorkingDays:
+    def week(self, start=18, n=7):
+        return [datetime.date(2026, 9, start + i) for i in range(n)]
+
+    def test_excludes_sunday(self, monkeypatch):
+        monkeypatch.delenv("AADHAR_NON_WORKING_WEEKDAYS", raising=False)
+        # 18-24 Sept 2026: Friday..Thursday, containing one Sunday (the 20th).
+        working, excluded, unknown = parsers.split_working_days(self.week())
+        assert working == 6
+        assert [d.day for d in excluded] == [20]
+        assert excluded[0].weekday() == 6
+        assert unknown == 0
+
+    def test_saturday_counts_as_working(self, monkeypatch):
+        monkeypatch.delenv("AADHAR_NON_WORKING_WEEKDAYS", raising=False)
+        # Saturday alone.
+        working, excluded, _ = parsers.split_working_days([datetime.date(2026, 9, 19)])
+        assert working == 1
+        assert excluded == []
+
+    def test_all_non_working_yields_zero(self, monkeypatch):
+        monkeypatch.delenv("AADHAR_NON_WORKING_WEEKDAYS", raising=False)
+        working, excluded, _ = parsers.split_working_days([datetime.date(2026, 9, 20)])
+        assert working == 0
+        assert len(excluded) == 1
+
+    def test_unknown_dates_count_as_working(self, monkeypatch):
+        """A target is a ceiling; an unparseable label must not quietly lower it."""
+        monkeypatch.delenv("AADHAR_NON_WORKING_WEEKDAYS", raising=False)
+        working, excluded, unknown = parsers.split_working_days([None, datetime.date(2026, 9, 21)])
+        assert working == 2
+        assert unknown == 1
+        assert excluded == []
+
+    def test_a_quiet_sunday_is_still_a_sunday(self, monkeypatch):
+        """Measured by the date, not by activity: a Sunday reporting nothing must
+        not shrink the target, or a missing upload would flatter the result."""
+        monkeypatch.delenv("AADHAR_NON_WORKING_WEEKDAYS", raising=False)
+        working, excluded, _ = parsers.split_working_days(
+            [datetime.date(2026, 9, 21), datetime.date(2026, 9, 27)])  # Mon + Sun
+        assert working == 1
+        assert [d.day for d in excluded] == [27]
+
+    def test_describe_names_the_days(self, monkeypatch):
+        monkeypatch.delenv("AADHAR_NON_WORKING_WEEKDAYS", raising=False)
+        _, excluded, _ = parsers.split_working_days(self.week())
+        text = parsers.describe_excluded(excluded)
+        assert "Sunday" in text
+        assert "20-09-2026" in text
+        assert parsers.describe_excluded([]) == ""
+
+
+class TestTargetArithmetic:
+    """Regression test pinned to the real 18-24 September 2026 data.
+
+    The target used to be Daily Target x number-of-uploads, so a selected range
+    containing a Sunday set a target no division could meet. On this data it
+    understated Hisar by 12.3 percentage points and the eleven-division mean by
+    6.3.
+    """
+
+    ACHIEVED = {"Hisar": 3302, "Karnal": 3438, "Ambala": 1530, "Rohtak": 1098}
+
+    def test_hisar_is_not_understated_by_a_sunday(self, monkeypatch):
+        monkeypatch.delenv("AADHAR_NON_WORKING_WEEKDAYS", raising=False)
+        days = [datetime.date(2026, 9, d) for d in (18, 19, 20, 21, 22, 23, 24)]
+        working, excluded, _ = parsers.split_working_days(days)
+        assert working == 6 and len(excluded) == 1
+
+        daily = parsers.daily_target_for("Hisar")
+        old_pct = self.ACHIEVED["Hisar"] / (daily * len(days)) * 100
+        new_pct = self.ACHIEVED["Hisar"] / (daily * working) * 100
+        assert round(old_pct, 1) == 73.7
+        assert round(new_pct, 1) == 86.0
+        assert new_pct - old_pct > 12.0
+
+    def test_every_division_improves_when_a_sunday_is_dropped(self, monkeypatch):
+        monkeypatch.delenv("AADHAR_NON_WORKING_WEEKDAYS", raising=False)
+        days = [datetime.date(2026, 9, d) for d in (18, 19, 20, 21, 22, 23, 24)]
+        working, _, _ = parsers.split_working_days(days)
+        for division, achieved in self.ACHIEVED.items():
+            daily = parsers.daily_target_for(division)
+            assert achieved / (daily * working) * 100 > achieved / (daily * len(days)) * 100
+
+    def test_achievement_still_counts_sunday_transactions(self, monkeypatch):
+        """Excluding Sunday from the target must not exclude its activity."""
+        monkeypatch.delenv("AADHAR_NON_WORKING_WEEKDAYS", raising=False)
+        sunday = datetime.date(2026, 9, 20)
+        working, excluded, _ = parsers.split_working_days([sunday])
+        assert working == 0 and excluded == [sunday]
+        # The two stations that did report on that Sunday are real achievement.
+        assert 11 + 18 + 0 + 1 == 30
 
 
 class TestEnsureCols:

@@ -17,6 +17,7 @@ ones worth pinning down in tests (see tests/test_parsers.py):
 """
 
 import difflib
+import os
 import re
 import sqlite3
 from datetime import datetime
@@ -106,6 +107,82 @@ _TARGET_LOOKUP = {norm(k): v for k, v in DIVISION_DAILY_TARGETS.items()}
 def daily_target_for(division):
     """Daily target for a division name, matched ignoring case/spacing. None if not configured."""
     return _TARGET_LOOKUP.get(norm(division))
+
+
+# ---------------------------------------------------------------- working days
+# Divisional post offices are closed on Sundays. A few branches (RMS, delivery
+# offices) still operate, so Sunday transactions are real and are counted as
+# achievement - but a Sunday is not a day of opportunity, so it must not inflate
+# the target the division is measured against.
+#
+# Configurable rather than hardcoded: AADHAR_NON_WORKING_WEEKDAYS takes
+# comma-separated Python weekday indices, Monday=0 .. Sunday=6. Empty or
+# unparseable means Sundays only. Indian post offices do not close on the second
+# Saturday, so Saturdays are working days by default.
+DEFAULT_NON_WORKING_WEEKDAYS = (6,)  # Sunday
+_WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                   "Saturday", "Sunday")
+
+
+def non_working_weekdays():
+    """Weekday indices treated as non-working, from AADHAR_NON_WORKING_WEEKDAYS."""
+    raw = os.environ.get("AADHAR_NON_WORKING_WEEKDAYS")
+    if raw is None:
+        return DEFAULT_NON_WORKING_WEEKDAYS
+    if not raw.strip():
+        return ()
+    picked = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if 0 <= value <= 6 and value not in picked:
+            picked.append(value)
+    return tuple(sorted(picked))
+
+
+def split_working_days(dates):
+    """Split dates into (working_count, excluded, unknown_count).
+
+    `dates` is an iterable of `date` objects, or None where an upload's label
+    could not be read as a calendar date.
+
+    Unknown dates are counted as working. A target is a ceiling, and quietly
+    lowering it because a label was unparseable would flatter the achievement
+    figure; the count is returned so the caller can say so.
+
+    A day is decided by the upload's own label, not by how much it reported: a
+    Sunday with two stations reporting is still a Sunday, and a Sunday with none
+    is still a Sunday. Measuring opportunity by activity would let a bad upload
+    quietly shrink the target.
+    """
+    non_working = set(non_working_weekdays())
+    working = 0
+    unknown = 0
+    excluded = []
+    for d in dates:
+        if d is None:
+            unknown += 1
+            working += 1
+            continue
+        if d.weekday() in non_working:
+            excluded.append(d)
+        else:
+            working += 1
+    return working, excluded, unknown
+
+
+def describe_excluded(excluded):
+    """Human-readable list of the non-working days dropped from a target."""
+    if not excluded:
+        return ""
+    names = ", ".join(sorted({_WEEKDAY_NAMES[d.weekday()] for d in excluded}))
+    dates = ", ".join(d.strftime("%d-%m-%Y") for d in sorted(excluded))
+    return f"Excluded {len(excluded)} non-working day(s) ({names}): {dates}."
 
 
 # ---------------------------------------------------------------- date labels

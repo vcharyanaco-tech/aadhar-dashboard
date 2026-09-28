@@ -27,12 +27,14 @@ import parsers
 from parsers import (
     daily_target_for,
     date_from_filename,
+    describe_excluded,
     norm_key,
     parse_first_usable as read_file,
     parse_label_date,
     parse_master,
     parse_operator_master,
     parse_tx,
+    split_working_days,
 )
 
 DATA_DIR = Path(os.environ.get("APP_DATA_DIR", "data"))
@@ -539,33 +541,57 @@ def dashboard():
             "New enrolment", "MBU", "Demographic updates", "Non-MBU", "Updates", "Total"]
     show = show[cols].sort_values("Total", ascending=False)
 
-    period_days = len(ids)
+    # The target is Daily Target x the number of *working* days selected, not
+    # the number of uploads. Divisional offices are closed on Sundays, so
+    # counting a Sunday as a full day of opportunity understates achievement -
+    # by 12 points for Hisar across 18-24 September 2026. Sunday transactions
+    # that did happen (RMS and delivery branches) still count as achievement.
+    label_by_id = {r["id"]: r["label"] for r in uploads}
+    period_days, excluded, unknown_dates = split_working_days(
+        [parse_label_date(label_by_id.get(i)) for i in ids])
     tgt = show.groupby("Division")["Total"].sum().reset_index().rename(columns={"Total": "Achievement"})
     tgt["Daily Target"] = tgt["Division"].map(daily_target_for)
     no_target = sorted(tgt.loc[tgt["Daily Target"].isna(), "Division"])
     tgt = tgt.dropna(subset=["Daily Target"])
     if len(tgt):
-        tgt["Target"] = (tgt["Daily Target"] * period_days).astype(int)
-        tgt["Achievement"] = tgt["Achievement"].astype(int)
-        tgt["Shortfall / Surplus"] = tgt["Achievement"] - tgt["Target"]
-        tgt["% Achieved"] = (tgt["Achievement"] / tgt["Target"] * 100).round(1)
+        if period_days <= 0:
+            # Every selected day is a non-working day. A target of zero would
+            # make the percentage meaningless, so say so rather than divide.
+            st.subheader("Target vs Achievement")
+            st.warning(
+                "Every day in the selected period is a non-working day, so there is no "
+                "target to measure against. Transactions from those days are still "
+                "shown in the station details below. "
+                + describe_excluded(excluded))
+        else:
+            tgt["Target"] = (tgt["Daily Target"] * period_days).astype(int)
+            tgt["Achievement"] = tgt["Achievement"].astype(int)
+            tgt["Shortfall / Surplus"] = tgt["Achievement"] - tgt["Target"]
+            tgt["% Achieved"] = (tgt["Achievement"] / tgt["Target"] * 100).round(1)
 
-        st.subheader("Target vs Achievement")
-        st.caption(f"Target = Daily Target x {period_days} working day(s) selected above. "
-                   "Achievement = actual transactions in the same period, for the divisions currently in view.")
-        fig_t = px.bar(tgt.melt("Division", value_vars=["Target", "Achievement"],
-                                var_name="Type", value_name="Count"),
-                       x="Division", y="Count", color="Type", barmode="group", text="Count",
-                       color_discrete_map={"Target": "#B0B0B0", "Achievement": "#7A1F2B"},
-                       title="Target vs Achievement (transactions)")
-        fig_t.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
-        st.plotly_chart(fig_t, use_container_width=True)
+            st.subheader("Target vs Achievement")
+            st.caption(
+                f"Target = Daily Target x {period_days} working day(s) selected above "
+                f"({len(ids)} upload(s) in total). "
+                "Achievement = actual transactions in the same period, for the divisions "
+                "currently in view."
+                + ((" " + describe_excluded(excluded)) if excluded else "")
+                + (f" {unknown_dates} upload label(s) could not be read as a date and "
+                   "were counted as working days." if unknown_dates else ""))
+            fig_t = px.bar(tgt.melt("Division", value_vars=["Target", "Achievement"],
+                                    var_name="Type", value_name="Count"),
+                           x="Division", y="Count", color="Type", barmode="group", text="Count",
+                           color_discrete_map={"Target": "#B0B0B0", "Achievement": "#7A1F2B"},
+                           title="Target vs Achievement (transactions)")
+            fig_t.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
+            st.plotly_chart(fig_t, use_container_width=True)
 
-        tshow = tgt[["Division", "Target", "Achievement", "Shortfall / Surplus", "% Achieved"]] \
-            .sort_values("Division")
-        st.dataframe(tshow, hide_index=True, use_container_width=True)
-        st.download_button("Download Target vs Achievement CSV", tshow.to_csv(index=False).encode("utf-8-sig"),
-                           "target_vs_achievement.csv", "text/csv", key="dl_target_vs_ach")
+            tshow = tgt[["Division", "Target", "Achievement", "Shortfall / Surplus", "% Achieved"]] \
+                .sort_values("Division")
+            st.dataframe(tshow, hide_index=True, use_container_width=True)
+            st.download_button("Download Target vs Achievement CSV",
+                               tshow.to_csv(index=False).encode("utf-8-sig"),
+                               "target_vs_achievement.csv", "text/csv", key="dl_target_vs_ach")
         if no_target:
             st.caption("No target configured for: " + ", ".join(no_target))
     else:

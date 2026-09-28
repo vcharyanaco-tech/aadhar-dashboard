@@ -67,6 +67,7 @@ committed secrets.
 | `AADHAR_SYNC_MAX_BYTES` | no | `20971520` | Refuse to push a snapshot above this size (20 MiB; Workers KV caps a value at 25) |
 | `AADHAR_DEFAULT_TEMP_PASSWORD` | no | random per batch | Shared initial password for bulk-created division logins. Unset means a random password is generated for each batch and shown once. |
 | `SESSION_TIMEOUT_MINUTES` | no | `30` | Idle logout. `0` disables it. Streamlit reruns on every interaction, so this is a reliable activity signal. |
+| `AADHAR_NON_WORKING_WEEKDAYS` | no | `6` | Weekdays excluded from the target, as Python weekday indices (Monday=0 … Sunday=6). Sundays only by default; Indian post offices do not close on the second Saturday. |
 
 The bridge is off unless both `AADHAR_SYNC_URL` and `AADHAR_SYNC_TOKEN` are set,
 so local development is unaffected.
@@ -309,6 +310,37 @@ npx wrangler secret put AADHAR_ORIGIN   # the service's https://<name>.onrender.
 npx wrangler deploy
 curl https://aadhar-keepalive.aadhar-haryana.workers.dev/status
 ```
+
+## Targets and achievement
+
+**The target is Daily Target × *working* days, not × uploads.** Divisional post
+offices are closed on Sundays, so a Sunday is not a day of opportunity. The old
+arithmetic counted every upload, and on the real 18–24 September 2026 data that
+understated Hisar by **12.3 percentage points** and the eleven-division mean by
+6.3 — the Circle would have reported against a target it could never meet.
+
+| | As shown before | Correct |
+|---|---|---|
+| Hisar | 73.7% | 86.0% |
+| Karnal | 55.8% | 65.1% |
+| Faridabad | 49.9% | 58.2% |
+| Mean, 11 divisions | 37.7% | 44.0% |
+
+Two deliberate choices:
+
+- **Sunday *activity* still counts as achievement.** A few branches (RMS,
+  delivery offices) operate on Sundays and those transactions are real. They are
+  counted in the numerator and excluded only from the target multiplier.
+- **A day is classified by its date, never by how much it reported.** A Sunday
+  with no uploads is still a Sunday. Deciding by activity would let a missing
+  upload quietly shrink the target and flatter the result.
+
+The caption under the chart names the excluded days, so a figure that differs
+from last week is explainable rather than mysterious. An upload whose label
+cannot be read as a date is counted as a working day — a target is a ceiling, and
+silently lowering it would flatter achievement — and the count is shown.
+
+Change the pattern with `AADHAR_NON_WORKING_WEEKDAYS` (no redeploy needed).
 
 ## Security notes
 

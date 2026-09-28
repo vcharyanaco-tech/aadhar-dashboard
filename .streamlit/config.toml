@@ -1,0 +1,18 @@
+[server]
+baseUrlPath = "aadhar-dashboard"
+headless = true
+address = "0.0.0.0"
+# This is a single-file app in a container, so the module watcher only ever
+# stats files that never change. It is not free: it competes for the same
+# throttled free-plan CPU as the script run.
+fileWatcherType = "none"
+enableXsrfProtection = true
+enableCORS = true
+corsAllowedOrigins = [
+  "https://dashboardharyana.site",
+  "https://www.dashboardharyana.site",
+]
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false

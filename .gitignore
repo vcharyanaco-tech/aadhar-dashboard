@@ -3,3 +3,8 @@ dist/
 *.local
 *.tsbuildinfo
 .DS_Store
+.venv/
+data/
+__pycache__/
+*.py[cod]
+*.lnk

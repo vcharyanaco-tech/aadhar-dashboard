@@ -1,0 +1,14 @@
+[server]
+baseUrlPath = "aadhar-dashboard"
+headless = true
+address = "0.0.0.0"
+enableXsrfProtection = true
+enableCORS = true
+corsAllowedOrigins = [
+  "https://dashboardharyana.site",
+  "https://www.dashboardharyana.site",
+]
+maxUploadSize = 200
+
+[browser]
+gatherUsageStats = false

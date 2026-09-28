@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: aadhar-dashboard
+    runtime: python
+    plan: 0.5c-512mb
+    region: singapore
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
+    healthCheckPath: /aadhar-dashboard/_stcore/health
+    autoDeployTrigger: commit
+    numInstances: 1
+    disk:
+      name: aadhaar-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.14.3"
+      - key: APP_DATA_DIR
+        value: /var/data
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false

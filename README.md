@@ -44,7 +44,7 @@ committed secrets.
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
-| `APP_DATA_DIR` | no | `./data` | Directory holding `aadhaar.db`. Set this to the Render disk mount. |
+| `APP_DATA_DIR` | no | `./data` | Directory holding `aadhaar.db`. Point this at a disk mount if one is attached. |
 | `ADMIN_USERNAME` | on a fresh database | none | Username for the first administrator |
 | `ADMIN_PASSWORD` | on a fresh database | none | Password for the first administrator |
 
@@ -72,8 +72,8 @@ not matter.
 
 ## Deployment
 
-`render.yaml` defines a Blueprint: a Python web service with a 1 GB persistent
-disk mounted at `/var/data`, and `APP_DATA_DIR=/var/data`.
+`render.yaml` defines a Blueprint: a Python web service on the free plan in
+`oregon`, matching the existing `dash-site` service.
 
 ```
 buildCommand: pip install -r requirements.txt
@@ -83,6 +83,23 @@ startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
 Apply the Blueprint in Render and supply `ADMIN_USERNAME` and `ADMIN_PASSWORD`
 when prompted. Render prompts for them rather than taking values from the
 repository, so the credentials are never committed.
+
+### The database does not persist on the free plan
+
+This service has **no persistent disk**, because Render only offers disks on paid
+plans. `aadhaar.db` therefore lives on Render's ephemeral filesystem and is
+**deleted on every deploy and every restart**. A free instance also spins down
+after a period of inactivity.
+
+Consequences to be aware of:
+
+- Any uploaded master, transaction, camp and user data is lost on each deploy.
+- To rebuild state, re-upload the source spreadsheets after each deploy.
+- The admin backup/restore tab can export a copy of the database, but a copy is
+  only useful if you download it somewhere durable.
+
+If the data needs to survive, either attach a disk (requires a paid plan) or
+switch `APP_DATA_DIR` to an external location.
 
 `.streamlit/config.toml` configures Streamlit for the reverse proxy: base path
 `aadhar-dashboard`, XSRF and CORS enabled, the two public origins allowlisted, a

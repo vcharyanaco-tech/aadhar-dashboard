@@ -20,6 +20,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import kv_sync
+
 DATA_DIR = Path(os.environ.get("APP_DATA_DIR", str(Path(__file__).resolve().parent / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB = DATA_DIR / "aadhaar.db"
@@ -167,6 +169,7 @@ def restore_database_backup(blob):
         finally:
             target.close()
             source.close()
+    kv_sync.request_backup()
     return summary
 
 
@@ -194,12 +197,14 @@ def add_user(username, password, role="user", must_change=0):
     salt, h = hash_pw(password)
     run("INSERT INTO users(username, salt, pw_hash, role, created_at, must_change) VALUES (?,?,?,?,?,?)",
         (username, salt, h, role, datetime.now().strftime("%Y-%m-%d %H:%M"), must_change))
+    kv_sync.request_backup()
 
 
 def set_password(username, password, must_change=0):
     salt, h = hash_pw(password)
     run("UPDATE users SET salt=?, pw_hash=?, fails=0, locked_until=NULL, must_change=? WHERE username=?",
         (salt, h, must_change, username))
+    kv_sync.request_backup()
 
 
 def slugify_username(name):
@@ -229,6 +234,10 @@ def bulk_create_division_users(temporary_password):
 
 
 def authenticate(username, password):
+    # The fails/locked_until updates below are deliberately NOT followed by
+    # kv_sync.request_backup(). They are transient lockout counters, and syncing
+    # them would let anyone able to guess a username burn a Workers KV write per
+    # attempt. They reset on the next successful login regardless.
     username = username.strip().lower()
     u = run("SELECT * FROM users WHERE username=?", (username,), one=True)
     generic = "Invalid username or password."
@@ -483,6 +492,7 @@ def save_master(m):
         con.commit()
     finally:
         con.close()
+    kv_sync.request_backup()
 
 
 def ensure_cols(con, table, wanted):
@@ -503,6 +513,7 @@ def save_tx(t, label, by):
         con.commit()
     finally:
         con.close()
+    kv_sync.request_backup()
 
 
 # ---------------------------------------------------------------- camps
@@ -526,6 +537,7 @@ def save_camp(camp_date, division, sub_division, location, transactions, remarks
         VALUES (?,?,?,?,?,?,?,?)""",
         (camp_date, division, sub_division, location, transactions, remarks, by,
          datetime.now().strftime("%Y-%m-%d %H:%M")))
+    kv_sync.request_backup()
 
 
 # ---------------------------------------------------------------- screens
@@ -798,6 +810,7 @@ def upload_tab():
         if st.button("Delete selected upload"):
             run("DELETE FROM tx WHERE upload_id=?", (pick_id,))
             run("DELETE FROM uploads WHERE id=?", (pick_id,))
+            kv_sync.request_backup()
             flash("Upload deleted.")
 
 
@@ -921,11 +934,13 @@ def users_tab():
     a, b = st.columns(2)
     if a.button("Disable login" if row["active"] else "Enable login"):
         run("UPDATE users SET active=? WHERE username=?", (0 if row["active"] else 1, target))
+        kv_sync.request_backup()
         flash("User updated.")
     with b:
         sure = st.checkbox("Confirm delete")
         if st.button("Delete user") and sure:
             run("DELETE FROM users WHERE username=?", (target,))
+            kv_sync.request_backup()
             flash(f"User '{target}' deleted.")
 
 
@@ -1183,6 +1198,7 @@ def camps_tab():
             pick = st.selectbox("Select entry", list(opts), key="camp_del_pick")
             if st.button("Delete this entry"):
                 run("DELETE FROM camps WHERE id=?", (opts[pick],))
+                kv_sync.request_backup()
                 flash("Camp entry deleted.")
 
 

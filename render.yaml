@@ -6,7 +6,9 @@ services:
     region: oregon
     branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
+    # boot.py restores aadhaar.db from the Cloudflare Worker bridge before
+    # Streamlit opens the database, then execs Streamlit. See kv_sync.py.
+    startCommand: python boot.py
     healthCheckPath: /aadhar-dashboard/_stcore/health
     autoDeployTrigger: commit
     numInstances: 1
@@ -16,4 +18,8 @@ services:
       - key: ADMIN_USERNAME
         sync: false
       - key: ADMIN_PASSWORD
+        sync: false
+      - key: AADHAR_SYNC_URL
+        value: https://dashboardharyana.site/api/backup
+      - key: AADHAR_SYNC_TOKEN
         sync: false

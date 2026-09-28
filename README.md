@@ -47,6 +47,11 @@ committed secrets.
 | `APP_DATA_DIR` | no | `./data` | Directory holding `aadhaar.db`. Point this at a disk mount if one is attached. |
 | `ADMIN_USERNAME` | on a fresh database | none | Username for the first administrator |
 | `ADMIN_PASSWORD` | on a fresh database | none | Password for the first administrator |
+| `AADHAR_SYNC_URL` | to enable the bridge | none | Base URL of the Worker bridge, e.g. `https://dashboardharyana.site/api/backup` |
+| `AADHAR_SYNC_TOKEN` | to enable the bridge | none | Bearer token for the bridge. Scoped to this app's single endpoint only. |
+| `AADHAR_SYNC_INTERVAL_MS` | no | `600000` | Snapshot cadence (10 minutes) |
+| `AADHAR_SYNC_WRITE_BUDGET` | no | `400` | Rolling daily cap on KV writes, so backups degrade rather than exhaust the Workers free tier |
+| `AADHAR_SYNC_MAX_BYTES` | no | `20971520` | Refuse to push a snapshot above this size (20 MiB; Workers KV caps a value at 25) |
 
 `ADMIN_USERNAME` and `ADMIN_PASSWORD` are only read when the `users` table has no
 administrator. If the database already has an admin account they are ignored.
@@ -61,14 +66,31 @@ account for 5 minutes after 5 failed attempts.
 The database is `aadhaar.db` inside `APP_DATA_DIR`. It is gitignored and must
 never be committed.
 
-To move a database between machines, use the admin **backup / restore** tools in
-the Manage users tab rather than copying the file. Restore validates the upload
-(50 MB limit, `PRAGMA quick_check`, required tables and columns, and rejection of
-views, triggers and virtual tables) before it replaces the live database.
+On a host with an ephemeral filesystem — Render's free plan has no disk — the
+database is mirrored to a Cloudflare Worker by `kv_sync.py`, which follows the
+same approach the Node service in `dash-site` uses
+(`src/server/data-sync.js`). `boot.py` restores the latest snapshot before
+Streamlit opens the database, and the app pushes a fresh snapshot after each
+write and on an interval. The Aadhaar service keeps a single KV key,
+`backup:aadhaar.sqlite`, so it never collides with the Node service's keys.
+
+The bridge is off unless both `AADHAR_SYNC_URL` and `AADHAR_SYNC_TOKEN` are set,
+so local development is unaffected. A snapshot is validated with
+`PRAGMA quick_check` and a required-table check before it is written over
+anything, and a restore never overwrites a database that already exists. If the
+bridge is unreachable the app still starts and logs the failure, degrading to the
+previous ephemeral behaviour rather than boot-looping.
 
 Uploaded source spreadsheets are parsed by `parse_master` and `parse_tx`, which
 match columns by name rather than position, so column order in the workbook does
-not matter.
+not matter. Uploads are parsed in memory, so the database is the only state the
+bridge needs to mirror.
+
+To move a database between machines by hand, use the admin **backup / restore**
+tools in the Manage users tab rather than copying the file. Restore validates the
+upload (50 MB limit, `PRAGMA quick_check`, required tables and columns, and
+rejection of views, triggers and virtual tables) before it replaces the live
+database.
 
 ## Deployment
 
@@ -77,29 +99,37 @@ not matter.
 
 ```
 buildCommand: pip install -r requirements.txt
-startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
+startCommand: python boot.py
 ```
 
 Apply the Blueprint in Render and supply `ADMIN_USERNAME` and `ADMIN_PASSWORD`
 when prompted. Render prompts for them rather than taking values from the
-repository, so the credentials are never committed.
+repository, so the credentials are never committed. `AADHAR_SYNC_TOKEN` is
+prompted for in the same way.
 
-### The database does not persist on the free plan
+### Surviving the free plan's lack of a disk
 
 This service has **no persistent disk**, because Render only offers disks on paid
 plans. `aadhaar.db` therefore lives on Render's ephemeral filesystem and is
 **deleted on every deploy and every restart**. A free instance also spins down
 after a period of inactivity.
 
-Consequences to be aware of:
+`kv_sync.py` removes the first problem: the Worker holds a copy in Workers KV, so
+a cold start or redeploy restores the database instead of losing it. The second
+problem is handled in the Worker — its `*/10 * * * *` cron pings this service's
+`_stcore/health` endpoint during roughly 06:00-21:00 IST and deliberately skips
+overnight, so the instance stays responsive through the working day and sleeps
+outside it.
 
-- Any uploaded master, transaction, camp and user data is lost on each deploy.
-- To rebuild state, re-upload the source spreadsheets after each deploy.
-- The admin backup/restore tab can export a copy of the database, but a copy is
-  only useful if you download it somewhere durable.
+This needs the bridge to be configured (`AADHAR_SYNC_URL` and
+`AADHAR_SYNC_TOKEN`); without it the service behaves exactly as before and loses
+its data on every deploy.
 
-If the data needs to survive, either attach a disk (requires a paid plan) or
-switch `APP_DATA_DIR` to an external location.
+The current database is about 5.6 MB. Workers KV caps a single value at 25 MiB, so
+`AADHAR_SYNC_MAX_BYTES` refuses to push anything larger rather than failing the
+write. Backups are also capped at 400 KV writes per UTC day. If the database ever
+approaches the size limit, attach a paid disk and set `APP_DATA_DIR` to it, and
+the bridge steps aside automatically.
 
 `.streamlit/config.toml` configures Streamlit for the reverse proxy: base path
 `aadhar-dashboard`, XSRF and CORS enabled, the two public origins allowlisted, a

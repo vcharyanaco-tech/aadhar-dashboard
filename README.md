@@ -65,6 +65,7 @@ committed secrets.
 | `AADHAR_SYNC_INTERVAL_MS` | no | `3600000` | Periodic snapshot cadence (1 hour) |
 | `AADHAR_SYNC_MIN_INTERVAL_MS` | no | `900000` | Floor between two pushes (15 min), so a burst of edits costs one push |
 | `AADHAR_SYNC_MAX_BYTES` | no | `20971520` | Refuse to push a snapshot above this size (20 MiB; Workers KV caps a value at 25) |
+| `AADHAR_DEFAULT_TEMP_PASSWORD` | no | random per batch | Shared initial password for bulk-created division logins. Unset means a random password is generated for each batch and shown once. |
 
 The bridge is off unless both `AADHAR_SYNC_URL` and `AADHAR_SYNC_TOKEN` are set,
 so local development is unaffected.
@@ -74,25 +75,32 @@ so local development is unaffected.
 These are documented here rather than silently left out, because they are
 things a reader of this file would otherwise assume work.
 
-- **The default temporary password is a hardcoded constant.** `DEFAULT_TEMP_PASSWORD`
-  in `app.py` is the shared initial password for every login created by *Bulk create
-  Division logins*. It lives in version control. Users are forced to change it on
-  first login, but the constant should be replaced with a per-batch random password
-  before this is relied on for anything sensitive.
+- **The old default password is still recoverable from git history.** The shared
+  default password used to be a hardcoded constant in `app.py` and is present in
+  commits up to `7be9c86` — including in this file's own history, since naming it
+  here would defeat the point. It now comes from `AADHAR_DEFAULT_TEMP_PASSWORD`,
+  so it is no longer added to new commits, but only rewriting history removes it
+  from the old ones. Anyone with read access to the repository still has it;
+  rotating it or rewriting history is a separate decision.
+- **The default password is shared across every division login.** It is generated
+  per batch when the env var is unset, but if it is set then every division gets
+  the same one. Users are forced to change it on first login.
 - **Restore is a manual admin action.** If `aadhaar.db` is lost, the app restores
   the newest bridge snapshot automatically at boot, but there is no in-app
   "roll back to generation X" button and no way to upload a replacement database
   from the UI. Use `python kv_sync.py restore`, or copy the file yourself, or
   re-upload the source spreadsheets. Full admin backup/restore tooling is not
   built yet.
-- **`render.yaml` still declares `ADMIN_USERNAME` and `ADMIN_PASSWORD`.** No code
-  reads them. They are harmless but misleading; the admin is created through the
-  first-run screen instead. They can be removed.
-- **The upload size limit depends on how the app is started.** `boot.py` passes
-  `--server.maxUploadSize=50`, and command-line flags take precedence over
-  `.streamlit/config.toml`, so **on Render the limit is 50 MB**. Started directly
-  (`run_app.bat`, `streamlit run app.py`) the `config.toml` value applies and the
-  limit is 200 MB. The two values disagree; pick one.
+- **Division logins can see every division's data.** Bulk creation makes one
+  login per division, but no query is scoped to the logged-in user's division, so
+  a Hisar login sees all eleven. The per-division credentials are cosmetic until
+  row-level access control exists.
+- **There is no row-level access control at all.** Every non-admin sees the same
+  figures; `role` only decides which pages load.
+- **Nothing pings this service to keep it awake.** The `*/10` cron in the
+  dash-site Worker pings the Node backend's `/api/health`, not this Streamlit
+  service, so a Render free instance still spins down overnight. Backups survive
+  the spin-down, but the first request of the day is slow.
 
 ## Data
 
@@ -107,25 +115,36 @@ Uploaded source spreadsheets are parsed in memory, so the database is the only
 state the bridge needs to mirror. `parse_master` and `parse_tx` match columns by
 name rather than position, so column order in the workbook does not matter.
 
-### Re-uploading the master is destructive
+### Re-uploading the master is guarded, not silent
 
-`save_master` uses `if_exists="replace"`, so a new master sheet **overwrites the
-whole master table**. Nothing checks that the new master still contains the
-station keys already referenced by `tx`. If the replacement uses different station
-IDs, every historical transaction row silently stops matching: the rows remain in
-the database but disappear from the dashboard and the report, and they will not
-appear in the "not in master" list either, because that list only covers the
-selected period. Back up the database before replacing the master.
+`save_master` still uses `if_exists="replace"`, so a new master sheet **replaces
+the whole master table** — but the write is now blocked by default if it would
+leave station keys that already appear in the transaction history unmatched. The
+admin is shown how many stations would be orphaned, a sample of their keys, and
+has to tick a box to proceed anyway.
+
+This mattered because the old behaviour lost data invisibly: rows that stopped
+matching stayed in the database but vanished from the dashboard and the report,
+and did not appear in the "not in master" list either, since that only covers the
+selected period.
 
 The same `replace` behaviour applies to the operator master. Transaction sheets
 are **appended**, never replaced, and are keyed by `upload_id`; deleting an upload
-in the Upload data tab removes its rows from `tx` as well.
+in the Upload data tab removes its rows from `tx` as well. Appending validates the
+frame against `parsers.TX_COLS` first, so a parser change that alters the shape
+fails loudly instead of drifting the table.
 
-### No indexes
+### Indexes
 
-`tx` has no index on `upload_id` or `key`, which are the two columns every
-report query filters and joins on. `init_db()` should add them; as `tx` grows
-this becomes a full table scan on each page load.
+`init_db()` creates `idx_tx_upload_id`, `idx_tx_key` and `idx_tx_key_upload` on
+`tx`, which are the columns every report query filters and joins on. A test
+asserts the query plan uses the index, so a future schema change cannot quietly
+drop back to a full scan.
+
+The two report builders are cached with `st.cache_data` and keyed on the selected
+upload ids. `clear_report_cache()` is called on every write that changes master or
+transaction data, so an upload shows up immediately; the five-minute TTL is a
+safety net rather than the mechanism.
 
 ## Deployment
 
@@ -251,16 +270,54 @@ returns 503 while `AADHAR_ORIGIN` is unset.
 - Uploaded spreadsheets are parsed with pandas; a file that fails to parse is
   rejected with the list of headers it actually contained, which is the main
   defence against a mis-mapped upload silently corrupting the numbers.
-- `ensure_cols()` in `app.py` builds `PRAGMA table_info` and `ALTER TABLE` with
-  f-string interpolation. It is only ever called with hardcoded table and column
-  names today, so it is not reachable, but it should not stay in that shape
-  alongside an otherwise parameterised codebase.
+- `ensure_cols()` and every other identifier that reaches SQL goes through
+  `parsers.quote_ident`, which rejects anything that is not a bare identifier, so
+  a future caller forwarding user input fails loudly instead of building
+  injectable SQL.
+
+## Layout
+
+| File | Purpose |
+| --- | --- |
+| `app.py` | Database helpers, authentication, the six screens, bootstrap |
+| `parsers.py` | Spreadsheet parsing and database persistence — pure functions over DataFrames, no Streamlit |
+| `kv_sync.py` | The off-site backup bridge client |
+| `backup-worker/` | The Cloudflare Worker that stores the snapshots |
+| `tests/test_parsers.py` | 77 tests covering the parsing and persistence rules |
+| `tools/smoketest_backup_tab.py` | Drives the real script through Streamlit's AppTest |
+
+## Tests
+
+```
+.venv/Scripts/python -m pytest tests/ -q
+```
+
+The suite exists to pin the rules that decide the reported numbers, which are
+easy to change by accident and would otherwise fail silently:
+
+- `parse_tx` treats the sheet's total column as authoritative and derives
+  `upd = total - new`, clipped at zero. Only without that column does it fall back
+  to summing MBU + demographic + non-MBU.
+- `norm_key` makes `00123`, `123` and `123.0` the same key, which is what the
+  master-to-transaction join depends on.
+- Replacing the master refuses to orphan history unless explicitly confirmed.
+- `save_tx` rejects a frame that does not match `TX_COLS`.
+- `quote_ident` rejects injected identifiers.
+- The report queries use the index, asserted via `EXPLAIN QUERY PLAN`.
+
+There is no coverage of the six screens; `tools/smoketest_backup_tab.py` covers
+the admin login path and the backup tab.
 
 ## Notes
 
-- The logo is read from `logo.png` (or `.jpg`/`.jpeg`/`.webp`) next to `app.py`.
+- The logo is read from `logo.png` (or `.jpg`/`.jpeg`/`.webp`) next to `app.py`,
+  and its MIME type comes from `mimetypes.guess_type`.
 - `data/`, `.venv/` and Python caches are gitignored.
-- `app.py` is the whole application: database helpers, authentication, the three
-  spreadsheet parsers and all six screens. The parsers are pure functions over
-  DataFrames and are the obvious thing to split out and cover with tests; there
-  are no tests in the repository today.
+- The upload cap is 15 MB, set in both `boot.py` (`--server.maxUploadSize`) and
+  `.streamlit/config.toml`. Streamlit gives the command-line flag precedence, so
+  the two must agree or the effective limit depends on how the app was started.
+- `run()` commits only for statements that are not `SELECT`/`PRAGMA`/`WITH`, so
+  reads no longer take a write lock.
+- `use_container_width` is deprecated in Streamlit 1.64 in favour of
+  `width='stretch'`. The calls still work and emit a warning; converting the
+  whole app at once was out of scope for the change that introduced the notice.

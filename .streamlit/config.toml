@@ -12,7 +12,10 @@ corsAllowedOrigins = [
   "https://dashboardharyana.site",
   "https://www.dashboardharyana.site",
 ]
-maxUploadSize = 200
+# Upload cap in MB. Kept in step with --server.maxUploadSize in boot.py: Streamlit
+# gives the command-line flag precedence, so the two must agree or the effective
+# limit depends on how the app was started.
+maxUploadSize = 15
 
 [browser]
 gatherUsageStats = false

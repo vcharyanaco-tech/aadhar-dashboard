@@ -32,7 +32,7 @@ def main():
         "--server.headless=true",
         "--server.enableCORS=false",
         "--server.enableXsrfProtection=true",
-        "--server.maxUploadSize=50",
+        "--server.maxUploadSize=15",
         "--browser.gatherUsageStats=false",
     ]
     print(f"[boot] starting: {' '.join(cmd)}", flush=True)

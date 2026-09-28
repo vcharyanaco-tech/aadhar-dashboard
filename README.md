@@ -103,13 +103,22 @@ things a reader of this file would otherwise assume work.
   has to be written deliberately rather than assumed to exist already.
 - **There is no row-level access control at all.** Every non-admin sees the same
   figures.
-- **The app is served directly by Render, not through Cloudflare.** The dash-site
-  Worker has no route for `/aadhar-dashboard/*` and no `AADHAR_ORIGIN` binding, so
-  `https://aadhar-dashboard.onrender.com` is the only public entry point. That
-  means no WAF, no rate limiting and no Content-Security-Policy in front of it.
-  Streamlit's own XSRF protection and the app's login are what stand between an
-  unauthenticated request and the data. Putting it behind the Worker would add
-  those, at the cost of the extra hop.
+- **The origin is reachable directly on Render.** The service is
+  `https://aadhar-dashboard-5i4x.onrender.com` (the slug Render generated, not a
+  predictable name). Nothing of ours proxies it — the dash-site Worker has no
+  route for `/aadhar-dashboard/*` and no `AADHAR_ORIGIN` binding. Render's own
+  edge puts it behind Cloudflare, but with rules nobody here controls, and it
+  sends `access-control-allow-origin: *`. `proxy-worker/` adds a header set we
+  do control; see its header comment for why that is hardening and not a
+  boundary.
+- **`AADHAR_SYNC_TOKEN` must match the Worker's `BRIDGE_TOKEN`.** If it does not,
+  every push and every restore is rejected with 401 while the app itself looks
+  perfectly healthy, and nothing is backed up. That is not hypothetical: the
+  service was deployed for hours with a placeholder token and the backup KV
+  namespace stayed empty the whole time. Run
+  `tools/check_backup_health.py` after any change to either side — it probes an
+  authenticated route, because `/health` is deliberately unauthenticated and will
+  happily report healthy while your token is wrong.
 
 ## Data
 
@@ -324,6 +333,7 @@ curl https://aadhar-keepalive.aadhar-haryana.workers.dev/status
 | `tests/test_parsers.py` | 77 tests covering the parsing and persistence rules |
 | `tests/test_screens.py` | 24 tests driving the real script through Streamlit's AppTest |
 | `tools/smoketest_backup_tab.py` | Interactive check of the admin login path and backup tab |
+| `tools/check_backup_health.py` | One-command check that the database is actually mirrored |
 
 ## Tests
 

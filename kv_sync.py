@@ -45,6 +45,11 @@ WRITE_BUDGET = int(float(os.environ.get("AADHAR_SYNC_WRITE_BUDGET") or 400))
 MAX_BYTES = int(float(os.environ.get("AADHAR_SYNC_MAX_BYTES") or 20 * 1024 * 1024))
 FETCH_TIMEOUT_MS = 20000
 
+# Cloudflare's bot rules reject urllib's default `Python-urllib/x.y` agent with
+# 403 on both GET and PUT, which would make every restore fail. The Node service
+# already sets an explicit agent for the same reason.
+USER_AGENT = "Mozilla/5.0 (compatible; aadhar-dashboard-sync/1.0; +https://dashboardharyana.site)"
+
 # Tables the app itself relies on. `master`/`tx` are created by the first
 # upload, so a legitimate empty database will not have them yet.
 REQUIRED_TABLES = ("users", "uploads", "camps")
@@ -72,7 +77,11 @@ def enabled():
 
 
 def _auth_headers():
-    return {"Authorization": "Bearer " + TOKEN, "Content-Type": "application/octet-stream"}
+    return {
+        "Authorization": "Bearer " + TOKEN,
+        "Content-Type": "application/octet-stream",
+        "User-Agent": USER_AGENT,
+    }
 
 
 def _get(path):

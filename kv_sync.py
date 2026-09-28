@@ -36,6 +36,11 @@ import urllib.request
 from pathlib import Path
 
 DATA_DIR = Path(os.environ.get("APP_DATA_DIR", str(Path(__file__).resolve().parent / "data")))
+# Created here, not lazily. Validation writes its temp file into DATA_DIR, and
+# on a fresh container the directory does not exist yet because boot.py runs
+# restore_data() before app.py is imported. Deferring this to app.py meant the
+# restore failed and the service silently booted empty.
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB = DATA_DIR / "aadhaar.db"
 
 BASE = (os.environ.get("AADHAR_SYNC_URL") or "").rstrip("/")
@@ -167,6 +172,7 @@ def restore_data():
     if DB.exists():
         return {"restored": False, "reason": "local db exists"}
     try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         raw = _get("/aadhaar-db")
         if not raw:
             return {"restored": False, "reason": "no snapshot in bridge"}
@@ -175,7 +181,6 @@ def restore_data():
             _stats["error"] = f"rejected snapshot: {detail}"
             _log(f"snapshot rejected, not written ({detail})")
             return {"restored": False, "reason": detail}
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
         DB.write_bytes(raw)
         # A restored copy must not be replayed against WAL side files left by an
         # earlier boot, so drop them and let SQLite open the snapshot clean.

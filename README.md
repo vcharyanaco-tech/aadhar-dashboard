@@ -103,19 +103,23 @@ things a reader of this file would otherwise assume work.
   has to be written deliberately rather than assumed to exist already.
 - **There is no row-level access control at all.** Every non-admin sees the same
   figures.
-- **The origin is reachable directly on Render.** The service is
-  `https://aadhar-dashboard-5i4x.onrender.com` (the slug Render generated, not a
-  predictable name). Nothing of ours proxies it — the dash-site Worker has no
-  route for `/aadhar-dashboard/*` and no `AADHAR_ORIGIN` binding. Render's own
-  edge puts it behind Cloudflare, but with rules nobody here controls, and it
-  sends `access-control-allow-origin: *`. `proxy-worker/` adds a header set we
-  do control; see its header comment for why that is hardening and not a
-  boundary.
+- **The public URL is `https://dashboardharyana.site/aadhar-dashboard/`.** It has
+  not changed. The dash-site Worker proxies that prefix to the Render origin
+  (`aadhar-dashboard-5i4x.onrender.com`, a `AADHAR_ORIGIN` secret) and forwards
+  WebSocket upgrades, redirecting the old `/aadhar.html` and
+  `/aadhar-dashboard/index.html` paths to the canonical form. The proxy adds
+  `X-Frame-Options: SAMEORIGIN`, `frame-ancestors 'self'`, `nosniff` and a
+  `Referrer-Policy`, and strips the origin's `Access-Control-Allow-Origin: *`.
+  The origin URL behind it is not something users should be given.
+- **The origin itself is unprotected and reachable.** Going straight to
+  `aadhar-dashboard-5i4x.onrender.com` returns no security headers at all and
+  `Access-Control-Allow-Origin: *`. Render's free plan has no IP allowlist, so
+  the proxy is a hardening layer rather than a boundary. `proxy-worker/` adds a
+  stricter header set but is redundant while the dash-site proxy is in place.
 - **`AADHAR_SYNC_TOKEN` must match the Worker's `BRIDGE_TOKEN`.** If it does not,
   every push and every restore is rejected with 401 while the app itself looks
   perfectly healthy, and nothing is backed up. That is not hypothetical: the
-  service was deployed for hours with a placeholder token and the backup KV
-  namespace stayed empty the whole time. Run
+  service ran with a mismatched token and its backup namespace stayed empty. Run
   `tools/check_backup_health.py` after any change to either side — it probes an
   authenticated route, because `/health` is deliberately unauthenticated and will
   happily report healthy while your token is wrong.
@@ -189,8 +193,8 @@ after a period of inactivity.
 `kv_sync.py` removes the first problem: a dedicated Cloudflare Worker holds a
 copy in Workers KV, so a cold start or redeploy restores the database instead of
 losing it. The keep-alive that holds the instance awake during the working day is the
-`aadhar-keepalive` Worker in this same repository (see below). It is not the
-dash-site cron, which only knows about the Node backend.
+`aadhar-keepalive` Worker in this same repository (see below). The dash-site
+cron only knows about the Node backend, so it does not cover this service.
 
 This needs the bridge to be configured (`AADHAR_SYNC_URL` and
 `AADHAR_SYNC_TOKEN`); without it the service loses its data on every deploy. The

@@ -1,0 +1,36 @@
+name = "aadhar-backup"
+main = "worker.js"
+account_id = "606780bc6c3ecd48289472c73d27a982"
+compatibility_date = "2026-08-04"
+
+# No `routes`. This Worker is machine-to-machine only and is deliberately NOT
+# attached to dashboardharyana.site — that zone lives in a different account.
+# The bridge is reachable only on aadhar-backup.aadhar-haryana.workers.dev,
+# inside an account that hosts no other project, so the write budget and the
+# stored backups cannot be touched by anything else.
+
+[observability]
+enabled = true
+
+[vars]
+# Newest N generations kept. At ~5.6 MB per snapshot this caps storage at ~67 MB,
+# far below the 1 GB free-tier allowance.
+RETAIN = "12"
+# Hard daily ceiling on pushes, enforced in the Worker. The client also spaces
+# its pushes out, so this is a backstop rather than the primary control.
+# Budget math: a push costs 3 KV writes (generation + pointer + stats). At the
+# client's 15-minute floor that is at most ~96 pushes/day, or ~288 writes/day,
+# comfortably inside the 1,000/day free-tier allowance. 120 leaves headroom for
+# manual pushes while staying safe.
+DAILY_PUSH_BUDGET = "120"
+# Refuse anything larger. Workers KV rejects a value over 25 MiB; staying under
+# it means an oversized snapshot is refused cleanly instead of failing the write.
+MAX_BYTES = "20971520"
+
+[[kv_namespaces]]
+binding = "BACKUPS"
+id = "7e6e4e763a6a4801b9bdebe5a8b52ff6"
+
+# The bridge token is a secret, never a var:
+#   wrangler secret put BRIDGE_TOKEN
+# It is the same value as the AADHAR_SYNC_TOKEN set on the Render service.

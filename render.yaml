@@ -17,7 +17,18 @@ services:
         value: "3.14.3"
       # No admin credentials here: the first-run setup screen creates the admin
       # in the database. ADMIN_USERNAME / ADMIN_PASSWORD are not read by the code.
+      #
+      # The bridge is the dedicated aadhar-backup Worker, in its own Cloudflare
+      # account, so its write budget and stored snapshots are not shared with
+      # dash-site. The old URL (dash-site's /api/backup) never worked: that
+      # Worker does not route /aadhaar-db, so every restore and push 404'd.
       - key: AADHAR_SYNC_URL
-        value: https://dashboardharyana.site/api/backup
+        value: https://aadhar-backup.aadhar-haryana.workers.dev
+      # Must match the BRIDGE_TOKEN secret on the aadhar-backup Worker.
       - key: AADHAR_SYNC_TOKEN
         sync: false
+      # Defaults are 1 hour / 15 minutes; stated here so the intent is visible.
+      - key: AADHAR_SYNC_INTERVAL_MS
+        value: "3600000"
+      - key: AADHAR_SYNC_MIN_INTERVAL_MS
+        value: "900000"

@@ -19,6 +19,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import kv_sync
+
 DATA_DIR = Path(os.environ.get("APP_DATA_DIR", "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB = DATA_DIR / "aadhaar.db"
@@ -100,12 +102,14 @@ def add_user(username, password, role="user", must_change=0):
     salt, h = hash_pw(password)
     run("INSERT INTO users(username, salt, pw_hash, role, created_at, must_change) VALUES (?,?,?,?,?,?)",
         (username, salt, h, role, datetime.now().strftime("%Y-%m-%d %H:%M"), must_change))
+    kv_sync.request_backup()
 
 
 def set_password(username, password, must_change=0):
     salt, h = hash_pw(password)
     run("UPDATE users SET salt=?, pw_hash=?, fails=0, locked_until=NULL, must_change=? WHERE username=?",
         (salt, h, must_change, username))
+    kv_sync.request_backup()
 
 
 def slugify_username(name):
@@ -387,8 +391,10 @@ def save_master(m):
     con = sqlite3.connect(DB)
     try:
         m.to_sql("master", con, if_exists="replace", index=False)
+        con.commit()
     finally:
         con.close()
+    kv_sync.request_backup()
 
 
 def parse_operator_master(df):
@@ -415,8 +421,10 @@ def save_operator_master(m):
     con = sqlite3.connect(DB)
     try:
         m.to_sql("operator_master", con, if_exists="replace", index=False)
+        con.commit()
     finally:
         con.close()
+    kv_sync.request_backup()
 
 
 def operator_names():
@@ -446,6 +454,7 @@ def save_tx(t, label, by):
         con.commit()
     finally:
         con.close()
+    kv_sync.request_backup()
 
 
 # ---------------------------------------------------------------- camps
@@ -469,6 +478,7 @@ def save_camp(camp_date, division, sub_division, location, transactions, remarks
         VALUES (?,?,?,?,?,?,?,?)""",
         (camp_date, division, sub_division, location, transactions, remarks, by,
          datetime.now().strftime("%Y-%m-%d %H:%M")))
+    kv_sync.request_backup()
 
 
 # ---------------------------------------------------------------- screens
@@ -836,6 +846,7 @@ def upload_tab():
         if st.button("Delete selected upload"):
             run("DELETE FROM tx WHERE upload_id=?", (pick_id,))
             run("DELETE FROM uploads WHERE id=?", (pick_id,))
+            kv_sync.request_backup()
             flash("Upload deleted.")
 
 
@@ -910,11 +921,13 @@ def users_tab():
     a, b = st.columns(2)
     if a.button("Disable login" if row["active"] else "Enable login"):
         run("UPDATE users SET active=? WHERE username=?", (0 if row["active"] else 1, target))
+        kv_sync.request_backup()
         flash("User updated.")
     with b:
         sure = st.checkbox("Confirm delete")
         if st.button("Delete user") and sure:
             run("DELETE FROM users WHERE username=?", (target,))
+            kv_sync.request_backup()
             flash(f"User '{target}' deleted.")
 
 
@@ -1173,6 +1186,124 @@ def excel_download(df, sheet_name, filename, label, bold_last_row=True):
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _backup_status_cached():
+    return kv_sync.get_status()
+
+
+def _age_text(seconds):
+    if seconds is None:
+        return "unknown"
+    if seconds < 60:
+        return f"{seconds} second(s) ago"
+    if seconds < 3600:
+        return f"{seconds // 60} minute(s) ago"
+    if seconds < 86400:
+        return f"{seconds // 3600} hour(s) ago"
+    return f"{seconds // 86400} day(s) ago"
+
+
+def _since_text(iso_ts):
+    return f" since {iso_ts}" if iso_ts else ""
+
+
+def backup_tab():
+    """Admin view of whether the off-site backup is actually working.
+
+    This exists because the old bridge failed silently: every restore and every
+    push returned 404, the only trace was one line in the boot log, and the app
+    looked perfectly healthy while holding no backups at all.
+    """
+    if not is_admin():  # server-side guard
+        st.error("Only the admin can view backup status.")
+        return
+
+    c1, c2 = st.columns([3, 1])
+    if c2.button("Refresh", key="bk_refresh", use_container_width=True):
+        _backup_status_cached.clear()
+
+    s = _backup_status_cached()
+    if not s["enabled"]:
+        st.info("The backup bridge is not configured on this host, so `aadhaar.db` is only "
+                "as durable as the disk it sits on. This is expected in local development. "
+                "On Render the database lives on an ephemeral filesystem and is destroyed on "
+                "every deploy, so AADHAR_SYNC_URL and AADHAR_SYNC_TOKEN must both be set.")
+        return
+
+    healthy = s["healthy"]
+    if healthy is True:
+        st.success("Backups are working.")
+    else:
+        st.error("Backups are NOT working. The database on this host is not backed up anywhere.")
+
+    if not s["reachable"]:
+        st.error(f"The bridge could not be reached: {s['bridge_error']}")
+
+    m = st.columns(4)
+    m[0].metric("Newest snapshot", _age_text(s["newest_snapshot_age_seconds"]))
+    m[1].metric("Last push from this instance", _age_text(s["last_backup_age_seconds"]))
+    m[2].metric("Snapshot size", f"{s['db_bytes'] / 1024 / 1024:.2f} MB" if s["db_bytes"] else "unknown")
+    m[3].metric("Consecutive failures", s["consecutive_failures"])
+
+    b = s.get("bridge") or {}
+    if b:
+        st.caption(f"Bridge: `{s['url']}` | snapshot age {_age_text(b.get('ageSeconds'))} | "
+                   f"pushes today {b.get('pushesToday')}/{b.get('dailyPushBudget')} "
+                   f"({b.get('pushesLeft')} left) | {b.get('trackedGenerations')} generation(s) kept, "
+                   f"oldest trimmed past {b.get('retain')}")
+    st.caption(f"Automatic push every {s['interval_minutes']} minute(s), and never sooner than "
+               f"{s['min_interval_minutes']} minute(s) after the last one. Writes that land inside that "
+               "window are pushed by the final push on shutdown.")
+
+    if s["last_error"]:
+        st.error(f"Last error: {s['last_error']}")
+    if s["skipped_budget"]:
+        st.warning("The bridge's daily push budget is exhausted, so pushes are paused until it resets. "
+                   "Restores still work. Raise DAILY_PUSH_BUDGET on the Worker, or lower "
+                   "AADHAR_SYNC_INTERVAL_MS so fewer pushes are needed.")
+    if s["skipped_size"]:
+        st.warning(f"The database is larger than AADHAR_SYNC_MAX_BYTES ({s['max_bytes']} bytes), so it is "
+                   "not being uploaded. Attach a persistent disk and stop using the bridge.")
+    if s["skipped_min_interval"]:
+        st.info("The most recent push was held back by the minimum interval, not lost. It goes out on the "
+                "next scheduled push or on shutdown.")
+    if s["pending_changes"]:
+        st.info(f"Changes are waiting to be pushed{_since_text(s['pending_since'])}.")
+    if s["restored"] and s["restored_from"]:
+        st.caption(f"This instance booted by restoring generation {s['restored_from']} from the bridge.")
+
+    a, b2 = st.columns(2)
+    if a.button("Back up now", type="primary", use_container_width=True, key="bk_backup_now"):
+        with st.spinner("Pushing a snapshot to the bridge..."):
+            result = kv_sync.backup_data(force=True, reason="admin")
+        _backup_status_cached.clear()
+        if result.get("backed_up"):
+            st.success(f"Pushed {result['bytes']:,} bytes as generation {result.get('generation')}.")
+        else:
+            st.error(f"Backup failed: {result.get('error') or result.get('reason')}")
+
+    with b2.expander("Kept snapshots", expanded=False):
+        gens = kv_sync.generations()
+        if gens and "error" in gens[0]:
+            st.error(gens[0]["error"])
+        elif gens:
+            st.dataframe(pd.DataFrame([{
+                "Generation": g["generation"],
+                "Pushed": g["at"],
+                "Age": _age_text(g["ageSeconds"]),
+                "Latest": "yes" if g["isLatest"] else "",
+            } for g in gens]), hide_index=True, use_container_width=True)
+        else:
+            st.info("The bridge holds no snapshots yet.")
+
+    st.caption("The same figures are available from a shell: `python kv_sync.py status` "
+               "(or `generations`).")
+
+
+def _since_text(iso_ts):
+    return f" since {iso_ts}" if iso_ts else ""
+
+
 def camps_tab():
     camp_entry_form()
     st.divider()
@@ -1242,6 +1373,7 @@ def camps_tab():
             pick = st.selectbox("Select entry", list(opts), key="camp_del_pick")
             if st.button("Delete this entry"):
                 run("DELETE FROM camps WHERE id=?", (opts[pick],))
+                kv_sync.request_backup()
                 flash("Camp entry deleted.")
 
 
@@ -1265,6 +1397,7 @@ PAGES = {"Dashboard": dashboard, "Operator Analysis": operator_analysis_tab, "Re
 if is_admin():
     PAGES["Upload data"] = upload_tab
     PAGES["Manage users"] = users_tab
+    PAGES["Backup status"] = backup_tab
 
 page = sidebar(list(PAGES))
 st.title(APP_NAME)

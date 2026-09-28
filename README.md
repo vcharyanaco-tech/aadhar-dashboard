@@ -5,7 +5,9 @@ targets across Haryana Circle divisions, sub-divisions and camps. It replaces th
 earlier React/Vite SPA.
 
 In production it is served by Streamlit on Render and proxied through the
-Cloudflare Worker in the `dash-site` repository.
+Cloudflare Worker in the `dash-site` repository. `aadhaar.db` is mirrored to a
+separate, dedicated Cloudflare Worker (`backup-worker/`) so it survives the
+ephemeral filesystem that Render's free plan provides.
 
 ## Features
 
@@ -17,6 +19,7 @@ Cloudflare Worker in the `dash-site` repository.
 | Camps | everyone | Camp entry log and totals; admins can delete entries |
 | Upload data | admin | Parse and import master, operator-master and transaction spreadsheets |
 | Manage users | admin | Create users, bulk-create division logins, reset passwords, enable/disable, delete |
+| Backup status | admin | Whether the off-site backup is actually working, plus a manual push |
 
 ## Requirements
 
@@ -57,10 +60,10 @@ committed secrets.
 | --- | --- | --- | --- |
 | `APP_DATA_DIR` | no | `./data` | Directory holding `aadhaar.db`. Point this at a disk mount if one is attached. |
 | `PORT` | on Render | `8501` | Port Streamlit binds to. Render sets this. |
-| `AADHAR_SYNC_URL` | to enable the bridge | none | Base URL of the Worker bridge, e.g. `https://dashboardharyana.site/api/backup` |
-| `AADHAR_SYNC_TOKEN` | to enable the bridge | none | Bearer token for the bridge. Scoped to this app's single endpoint only. |
-| `AADHAR_SYNC_INTERVAL_MS` | no | `600000` | Snapshot cadence (10 minutes) |
-| `AADHAR_SYNC_WRITE_BUDGET` | no | `400` | Rolling daily cap on KV writes, so backups degrade rather than exhaust the Workers free tier |
+| `AADHAR_SYNC_URL` | to enable the bridge | none | Base URL of the backup bridge. In production this is the dedicated Worker, see below. |
+| `AADHAR_SYNC_TOKEN` | to enable the bridge | none | Bearer token for the bridge. Must match the Worker's `BRIDGE_TOKEN` secret. |
+| `AADHAR_SYNC_INTERVAL_MS` | no | `3600000` | Periodic snapshot cadence (1 hour) |
+| `AADHAR_SYNC_MIN_INTERVAL_MS` | no | `900000` | Floor between two pushes (15 min), so a burst of edits costs one push |
 | `AADHAR_SYNC_MAX_BYTES` | no | `20971520` | Refuse to push a snapshot above this size (20 MiB; Workers KV caps a value at 25) |
 
 The bridge is off unless both `AADHAR_SYNC_URL` and `AADHAR_SYNC_TOKEN` are set,
@@ -76,10 +79,12 @@ things a reader of this file would otherwise assume work.
   Division logins*. It lives in version control. Users are forced to change it on
   first login, but the constant should be replaced with a per-batch random password
   before this is relied on for anything sensitive.
-- **Restore is a documented-but-unimplemented safety net.** If `aadhaar.db` is lost
-  and the bridge has no usable snapshot, there is currently no in-app way to get
-  the data back. Copy the file yourself, or re-upload the source spreadsheets.
-  The admin backup/restore tooling is not built yet.
+- **Restore is a manual admin action.** If `aadhaar.db` is lost, the app restores
+  the newest bridge snapshot automatically at boot, but there is no in-app
+  "roll back to generation X" button and no way to upload a replacement database
+  from the UI. Use `python kv_sync.py restore`, or copy the file yourself, or
+  re-upload the source spreadsheets. Full admin backup/restore tooling is not
+  built yet.
 - **`render.yaml` still declares `ADMIN_USERNAME` and `ADMIN_PASSWORD`.** No code
   reads them. They are harmless but misleading; the admin is created through the
   first-run screen instead. They can be removed.
@@ -144,38 +149,85 @@ plans. `aadhaar.db` therefore lives on Render's ephemeral filesystem and is
 **deleted on every deploy and every restart**. A free instance also spins down
 after a period of inactivity.
 
-`kv_sync.py` removes the first problem: the Worker holds a copy in Workers KV, so
-a cold start or redeploy restores the database instead of losing it. The second
-problem is handled in the Worker — its `*/10 * * * *` cron pings this service's
-`_stcore/health` endpoint during roughly 06:00-21:00 IST and deliberately skips
-overnight, so the instance stays responsive through the working day and sleeps
-outside it.
+`kv_sync.py` removes the first problem: a dedicated Cloudflare Worker holds a
+copy in Workers KV, so a cold start or redeploy restores the database instead of
+losing it. The second problem is handled in the dash-site Worker — its
+`*/10 * * * *` cron pings this service's `_stcore/health` endpoint during roughly
+06:00-21:00 IST and deliberately skips overnight, so the instance stays
+responsive through the working day and sleeps outside it.
 
 This needs the bridge to be configured (`AADHAR_SYNC_URL` and
-`AADHAR_SYNC_TOKEN`); without it the service behaves exactly as before and loses
-its data on every deploy.
+`AADHAR_SYNC_TOKEN`); without it the service loses its data on every deploy. The
+admin **Backup status** tab says so explicitly rather than looking healthy.
 
-The bridge restores only when the local file is **absent**, and a snapshot is
-validated with `PRAGMA quick_check` plus a required-table check before it is
-written over anything, so a corrupt download never replaces a live database. If
-the bridge is unreachable the app still starts and logs the failure, degrading to
-the previous ephemeral behaviour rather than boot-looping.
+#### The bridge Worker
 
-**Backups can fail silently.** The daily write budget is cumulative, resets at
-midnight UTC, and is shared with the Node service in `dash-site` because they use
-the same Worker. When the budget is exhausted `backup_data()` returns without
-pushing and without raising; the next restart then restores whatever the last
-successful snapshot was, so recent uploads can appear to have vanished. The
-current status is readable with:
+`backup-worker/` in this repository, deployed to its own Cloudflare account so
+that nothing else can spend its write budget or delete its snapshots:
+
+| | |
+| --- | --- |
+| URL | `https://aadhar-backup.aadhar-haryana.workers.dev` |
+| Worker | `aadhar-backup` |
+| KV namespace | `aadhar-dashboard-backups` |
+| Secret | `BRIDGE_TOKEN` (never committed) |
+
+Endpoints, all requiring `Authorization: Bearer <BRIDGE_TOKEN>` except `/health`:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Snapshot age, budget, retention. Unauthenticated, returns no database content. |
+| `GET` | `/db` | Download the newest snapshot |
+| `PUT` | `/db` | Push a new snapshot |
+| `GET` | `/db/<generation>` | Download a specific snapshot, for rollback |
+| `GET` | `/generations` | List retained snapshots |
+| `GET` | `/stats` | Push accounting |
+| `POST` | `/reconcile` | Rebuild the retention index from KV (rarely needed) |
+
+Deploy or update it with:
 
 ```
-python kv_sync.py status
+cd backup-worker
+npx wrangler secret put BRIDGE_TOKEN   # must match AADHAR_SYNC_TOKEN on Render
+npx wrangler deploy
 ```
 
-and `kv_sync.get_status()` exposes the same values. There is no admin UI for this
-yet. Given the database is roughly 5.6 MB and the instance is a single service,
-pushing a full snapshot after every write against a 400/day budget is harder than
-it needs to be; a slower cadence would be safer.
+**How durability works**
+
+- Each push writes a new `aadhar:gen:<timestamp>-<rand>` key and then moves the
+  `aadhar:latest` pointer, so an interrupted push can never corrupt the snapshot a
+  restore would use. The last `RETAIN` (12) generations are kept, which at ~5.6 MB
+  is roughly 67 MB — far inside the 1 GB free-tier allowance.
+- The **daily push budget is enforced in the Worker**, not in the app. The old
+  client counted writes in a module-level dict that reset on every Render
+  restart, so its 400/day cap was never actually enforced. The Worker refuses
+  pushes past `DAILY_PUSH_BUDGET` with `429` and an explicit reset time, and
+  **restores keep working even when the budget is exhausted** — a spent budget can
+  never block recovery.
+- A push costs 3 KV writes (generation + pointer + stats). With the 15-minute
+  floor that is at most ~96 pushes/day, about 288 writes, comfortably inside the
+  1,000/day free allowance.
+- Every write in the app calls `kv_sync.request_backup()`, which is debounced, so
+  a burst of edits coalesces into a single push. A change made shortly before a
+  deploy is captured by a final push on `SIGTERM` and on process exit.
+- **KV is eventually consistent.** A cold start within ~60s of a push may restore
+  the previous generation rather than the newest. That is the safe direction —
+  never a partial write — and the Backup status tab reports the age of the
+  newest snapshot, so a stale restore is visible.
+
+**Verifying it by hand**
+
+```
+python kv_sync.py status        # health, budget, last error, snapshot age
+python kv_sync.py backup        # force a push
+python kv_sync.py generations   # what the bridge is holding
+python kv_sync.py restore       # pull the newest snapshot into DATA_DIR
+```
+
+The same figures are in the admin **Backup status** tab. That tab exists because
+the previous bridge failed silently: every restore and every push returned `404`,
+the only trace was one line in the boot log, and the app looked healthy while
+holding no backups at all.
 
 `.streamlit/config.toml` configures Streamlit for the reverse proxy: base path
 `aadhar-dashboard`, XSRF and CORS enabled, the two public origins allowlisted, and

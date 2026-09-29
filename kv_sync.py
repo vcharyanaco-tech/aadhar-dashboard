@@ -81,6 +81,10 @@ USER_AGENT = "Mozilla/5.0 (compatible; aadhar-dashboard-sync/2.0; +https://dashb
 # the first upload, so a legitimate empty database will not have them yet.
 REQUIRED_TABLES = ("users", "uploads", "camps")
 
+# Tables the real data lives in. A database that has none of these has never
+# held a single transaction, and is what a botched boot leaves behind.
+DATA_TABLES = ("master", "tx", "operator_master")
+
 _stats = {
     "last_backup_at": None,
     "last_error": None,
@@ -92,6 +96,7 @@ _stats = {
     "skipped_budget": False,
     "skipped_size": False,
     "skipped_min_interval": False,
+    "skipped_empty": False,
 }
 _lock = threading.Lock()
 _thread_started = False
@@ -187,17 +192,29 @@ def _get_json(path):
         raise BridgeError("bridge returned malformed JSON") from None
 
 
-def _validate(raw):
-    """Confirm the downloaded bytes are a usable copy of the app's database.
-
-    A truncated or corrupt download must never be written over a live database,
-    so this checks SQLite integrity and that the tables the app opens at boot
-    are present before the caller is allowed to touch the filesystem.
-    """
-    tmp = Path(tempfile.mkstemp(prefix="kv-sync-validate-", suffix=".db", dir=str(DATA_DIR))[1])
+def _rowcount(con, table):
     try:
-        tmp.write_bytes(raw)
-        con = sqlite3.connect(str(tmp))
+        return con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    except sqlite3.DatabaseError:
+        return 0
+
+
+def _validate_file(path, require_data=False):
+    """Check that a file on disk is a usable copy of the app's database.
+
+    Validates in place. `_validate` (below) is the bytes variant for downloads;
+    anything we produced locally is already a file, so rewriting it into a second
+    temp file just to check it doubled the I/O of every single backup.
+
+    `require_data` additionally demands that the file actually contains the
+    app's data. This is the check that was missing, and its absence destroyed the
+    production database: `REQUIRED_TABLES` is only `users`/`uploads`/`camps`,
+    which is *precisely* the table set a failed boot leaves behind, so a 24 KB
+    database with zero users passed validation, was pushed over a 5.6 MB real
+    snapshot, and was then restored in its place on the next deploy.
+    """
+    try:
+        con = sqlite3.connect(str(path))
         try:
             integrity = con.execute("PRAGMA quick_check").fetchone()[0]
             if integrity != "ok":
@@ -206,11 +223,33 @@ def _validate(raw):
             missing = [t for t in REQUIRED_TABLES if t not in present]
             if missing:
                 return False, "missing tables: " + ", ".join(missing)
+            if require_data:
+                # No users means nobody can log in, so this is a botched boot,
+                # never a database worth pushing or restoring.
+                if _rowcount(con, "users") == 0:
+                    return False, "no users: this is an empty database, not a real one"
+                if not any(t in present for t in DATA_TABLES):
+                    return False, ("no data tables ("
+                                   + "/".join(DATA_TABLES) + "): this database has never held a transaction")
             return True, "ok"
         finally:
             con.close()
     except sqlite3.DatabaseError as err:
         return False, f"not a valid sqlite database ({err})"
+
+
+def _validate(raw, require_data=False):
+    """Confirm downloaded bytes are a usable copy of the app's database.
+
+    A truncated or corrupt download must never be written over a live database,
+    so this checks SQLite integrity and that the tables the app opens at boot
+    are present before the caller is allowed to touch the filesystem. Pass
+    `require_data` to also reject a structurally valid but empty database.
+    """
+    tmp = Path(tempfile.mkstemp(prefix="kv-sync-validate-", suffix=".db", dir=str(DATA_DIR))[1])
+    try:
+        tmp.write_bytes(raw)
+        return _validate_file(tmp, require_data=require_data)
     finally:
         try:
             tmp.unlink()
@@ -229,32 +268,59 @@ def restore_data():
     if not enabled():
         return {"restored": False, "reason": "disabled"}
     if DB.exists():
-        return {"restored": False, "reason": "local db exists"}
+        # An existing database is normally left alone, because a host with a real
+        # disk is rolling a deploy and the previous instance may still hold the
+        # file open. An *empty* one is different: it is the residue of a boot
+        # whose restore failed, it cannot be logged into, and it is what the
+        # outage above left on disk. There is nothing to protect, so re-restore.
+        if _locally_populated():
+            return {"restored": False, "reason": "local db exists"}
+        try:
+            DB.replace(DB.with_suffix(".db.empty-from-failed-restore"))
+            _log("local aadhaar.db has no users; moved aside and re-restoring")
+        except OSError as err:
+            _log(f"local aadhaar.db is empty but could not be moved aside ({err})")
+            return {"restored": False, "reason": "local db exists"}
     try:
-        raw, headers = _get("/db")
-        if not raw:
+        candidates = _restore_candidates()
+        if not candidates:
+            _log("restore skipped: the bridge holds no snapshot")
             return {"restored": False, "reason": "no snapshot in bridge"}
-        ok, detail = _validate(raw)
-        if not ok:
-            _stats["last_error"] = f"rejected snapshot: {detail}"
-            _stats["consecutive_failures"] += 1
-            _log(f"snapshot rejected, not written ({detail})")
-            return {"restored": False, "reason": detail}
-        DB.write_bytes(raw)
-        # A restored copy must not be replayed against WAL side files left by an
-        # earlier boot, so drop them and let SQLite open the snapshot clean.
-        for suffix in ("-wal", "-shm"):
+
+        for generation, path in candidates:
             try:
-                Path(str(DB) + suffix).unlink()
-            except OSError:
-                pass
-        generation = headers.get("X-Backup-Generation")
-        _stats["restored"] = True
-        _stats["restored_from"] = generation
-        _stats["db_bytes"] = len(raw)
-        _stats["last_error"] = None
-        _log(f"restored aadhaar.db from the bridge ({len(raw)} bytes, generation {generation})")
-        return {"restored": True, "bytes": len(raw), "generation": generation}
+                raw, _ = _get(f"/db/{generation}") if path else _get("/db")
+            except BridgeError as err:
+                _log(f"generation {generation} could not be fetched ({err}); trying the next one")
+                continue
+            if not raw:
+                continue
+            ok, detail = _validate(raw, require_data=True)
+            if not ok:
+                _stats["consecutive_failures"] += 1
+                _log(f"generation {generation} rejected ({detail}); trying the next one")
+                continue
+            DB.write_bytes(raw)
+            # A restored copy must not be replayed against WAL side files left by an
+            # earlier boot, so drop them and let SQLite open the snapshot clean.
+            for suffix in ("-wal", "-shm"):
+                try:
+                    Path(str(DB) + suffix).unlink()
+                except OSError:
+                    pass
+            _stats["restored"] = True
+            _stats["restored_from"] = generation
+            _stats["db_bytes"] = len(raw)
+            _stats["last_error"] = None
+            if generation == candidates[0][0] and len(candidates) > 1:
+                _log(f"restored generation {generation} ({len(raw)} bytes) after rejecting newer ones")
+            else:
+                _log(f"restored aadhaar.db from the bridge ({len(raw)} bytes, generation {generation})")
+            return {"restored": True, "bytes": len(raw), "generation": generation}
+
+        _stats["last_error"] = "every stored generation failed validation"
+        _log(_stats["last_error"])
+        return {"restored": False, "reason": "no stored generation passed validation"}
     except BridgeError as err:
         _stats["last_error"] = str(err)
         _stats["consecutive_failures"] += 1
@@ -265,6 +331,30 @@ def restore_data():
         _stats["consecutive_failures"] += 1
         _log(f"restore failed: {err}")
         return {"restored": False, "reason": str(err)}
+
+
+def _restore_candidates(limit=8):
+    """The snapshots worth trying, newest first.
+
+    The latest generation is not automatically the right one. A boot whose
+    restore failed used to create an empty database and push it, so "latest" was
+    an empty file; the restore then faithfully restored that empty file. Walking
+    back through older generations makes the restore recover from exactly that
+    situation instead of compounding it.
+    """
+    try:
+        listing = _get_json("/generations")
+    except BridgeError as err:
+        _log(f"could not list generations ({err}); will try the latest snapshot only")
+        return [(None, None)]
+    if not listing:
+        return [(None, None)]
+    out = []
+    for item in (listing.get("generations") or [])[:limit]:
+        gen = item.get("generation")
+        if gen:
+            out.append((gen, True))
+    return out or [(None, None)]
 
 
 def restore_generation(generation, keep_backup=True):
@@ -343,7 +433,10 @@ def _snapshot_bytes():
             dst.close()
             src.close()
         raw = out.read_bytes()
-        ok, detail = _validate(raw)
+        # Validate the file we just produced, in place. Rewriting 5.6 MB into a
+        # second temp file purely to integrity-check it doubled the disk I/O of
+        # every backup, and backups fire after every write.
+        ok, detail = _validate_file(out)
         if not ok:
             return None, f"snapshot failed validation: {detail}"
         return raw, "ok"
@@ -401,6 +494,22 @@ def backup_data(force=False, reason="manual"):
             _log(f"not pushed: snapshot is {len(payload)} bytes, over the {MAX_BYTES} byte cap")
             return {"backed_up": False, "error": _stats["last_error"]}
 
+        # The guard that would have stopped the data loss. A database with no
+        # users cannot be logged into, so it is what a boot that failed to
+        # restore leaves behind. Pushing one over a good snapshot destroys the
+        # only copy, and the next deploy then restores the empty file in its
+        # place. So an empty database may only be pushed when the bridge is
+        # genuinely empty - a real first install with nothing to lose.
+        if not _locally_populated():
+            if _bridge_has_snapshot():
+                _record_failure(
+                    "refusing to push an empty database over a stored snapshot", "skipped_empty")
+                _log("NOT PUSHED: this database has no users. A restore most "
+                     "likely failed, and pushing now would destroy the stored "
+                     "backup. Restoring is the fix; pushing is not.")
+                return {"backed_up": False, "error": _stats["last_error"]}
+            _log("bridge is empty, so the empty first-install database is being pushed")
+
         # The PUT response carries the Worker's authoritative accounting, so
         # there is no need for a second round trip to learn the budget state.
         _, body, _ = _call("PUT", "/db", payload=payload)
@@ -429,6 +538,41 @@ def backup_data(force=False, reason="manual"):
         _record_failure(str(err))
         _log(f"backup failed: {err}")
         return {"backed_up": False, "error": str(err)}
+
+
+def _locally_populated():
+    """Does the local database hold a real account, i.e. is it worth backing up?"""
+    if not DB.exists():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    except sqlite3.DatabaseError:
+        return False
+    try:
+        if _rowcount(con, "users") == 0:
+            return False
+        present = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        return any(t in present for t in DATA_TABLES)
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        con.close()
+
+
+def _bridge_has_snapshot():
+    """Does the bridge already hold something? Never raises: this only gates a push.
+
+    Anything unexpected - a network error, a malformed body, a shape this version
+    does not recognise - is treated as "yes, there is a snapshot", because the
+    opposite assumption would let the destructive push through.
+    """
+    try:
+        listing = _get_json("/generations")
+        if not isinstance(listing, dict):
+            return True
+        return bool(listing.get("latest"))
+    except Exception:
+        return True
 
 
 def _flush():

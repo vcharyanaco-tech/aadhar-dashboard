@@ -89,6 +89,51 @@ def seeded(env):
 
 
 # ---------------------------------------------------------------- module hygiene
+class TestPerformanceGuards:
+    """Guards against work that is cheap locally and expensive on the live host.
+
+    Render's free tier runs on a throttled shared CPU, and Streamlit re-executes
+    the whole script on every interaction, so anything done per render is paid
+    per click by every user.
+    """
+
+    def _source(self):
+        return (REPO / "app.py").read_text(encoding="utf-8")
+
+    def test_logo_is_encoded_through_a_cache_not_inline(self):
+        """118 KB of base64 per render was the single largest avoidable cost."""
+        src = self._source()
+        assert "def logo_data_uri" in src
+        assert "@st.cache_data" in src
+        # the login screen must go through the helper, not re-encode inline
+        login = src.split("def login_screen")[1].split("def ")[0]
+        assert "logo_data_uri()" in login
+        assert "b64encode" not in login
+
+    def test_snapshots_are_validated_in_place(self):
+        """Rewriting a 5.6 MB snapshot into a second file just to check it
+        doubled the disk I/O of every backup, and backups fire after every write."""
+        import kv_sync
+        assert hasattr(kv_sync, "_validate_file")
+        snapshot = (REPO / "kv_sync.py").read_text(encoding="utf-8")
+        body = snapshot.split("def _snapshot_bytes")[1].split("def ")[0]
+        assert "_validate_file(" in body
+        assert "ok, detail = _validate(raw)" not in body
+
+    def test_startup_pushes_without_waiting_for_the_interval(self):
+        """A boot that restored a snapshot used to leave the bridge unconfirmed
+        for a full hour."""
+        body = (REPO / "kv_sync.py").read_text(encoding="utf-8").split("def _loop")[1]
+        loop = body.split("while not _shutdown")[0]
+        assert "_flush()" in loop, "the interval loop must push before its first sleep"
+
+    def test_report_cache_is_cleared_by_the_writes_that_invalidate_it(self):
+        src = self._source()
+        for fn in ("replace_master", "save_operator_master", "save_tx"):
+            body = src.split(f"def {fn}")[1].split("\ndef ")[0]
+            assert "clear_report_cache()" in body, f"{fn} must invalidate the report cache"
+
+
 class TestModuleImports:
     """Guards against a missing import that only shows up on a code path the
     default tests never reach.

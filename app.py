@@ -57,6 +57,28 @@ APP_NAME = "HARYANA CIRCLE AADHAR MONITORING DASHBOARD"
 LOGO = next((p for n in ("logo.png", "logo.jpg", "logo.jpeg", "logo.webp")
              if (p := Path(__file__).parent / n).exists()), None)
 
+
+@st.cache_data(show_spinner=False)
+def _encode_logo(path_str, stamp):
+    """Encode the logo once. `stamp` is part of the cache key, so replacing
+    logo.png invalidates it without needing a manual cache clear."""
+    mime = mimetypes.guess_type(path_str)[0] or "image/png"
+    encoded = base64.b64encode(Path(path_str).read_bytes()).decode()
+    return f"data:{mime};base64,{encoded}"
+
+
+def logo_data_uri():
+    """The logo as a data URI, encoded once per process rather than per render.
+
+    It is ~88 KB on disk, which is ~118 KB once base64-encoded, and the login page
+    inlines it. Streamlit re-runs the whole script on every interaction, so
+    without this the same 118 KB was re-encoded on every single render.
+    """
+    if LOGO is None:
+        return None
+    stat = LOGO.stat()
+    return _encode_logo(str(LOGO), f"{stat.st_mtime_ns}-{stat.st_size}")
+
 st.set_page_config(page_title=APP_NAME, layout="wide")
 
 
@@ -166,6 +188,12 @@ def daily_targets():
     merged = dict(parsers.DIVISION_DAILY_TARGETS)
     merged.update(table)
     return merged
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _target_lookup_cached():
+    """Cached so the lookup is not rebuilt from a table read on every render."""
+    return target_lookup()
 
 
 def target_lookup():
@@ -495,10 +523,9 @@ LOGIN_CSS = """<style>
 def login_screen():
     st.markdown(LOGIN_CSS, unsafe_allow_html=True)
     plate = ""
-    if LOGO:
-        mime = mimetypes.guess_type(str(LOGO))[0] or "image/png"
-        b64 = base64.b64encode(LOGO.read_bytes()).decode()
-        plate = f'<div class="hp-plate"><img src="data:{mime};base64,{b64}" alt="India Post"></div><br>'
+    uri = logo_data_uri()
+    if uri:
+        plate = f'<div class="hp-plate"><img src="{uri}" alt="India Post"></div><br>'
     st.markdown(f'<div class="hp-band">{plate}<div class="hp-title">Aadhaar MIS Dashboard<br>'
                 'Department of Posts, India<br>Haryana Circle</div></div>', unsafe_allow_html=True)
     with st.form("login"):
@@ -615,7 +642,7 @@ def dashboard():
     period_days, excluded, unknown_dates = split_working_days(
         [parse_label_date(label_by_id.get(i)) for i in ids])
     achievement = show.groupby("Division")["Total"].sum().reset_index()
-    tgt, no_target = target_table(achievement, period_days, target_lookup())
+    tgt, no_target = target_table(achievement, period_days, _target_lookup_cached())
     if len(tgt) and period_days > 0:
         if period_days <= 0:
             # Every selected day is a non-working day. A target of zero would

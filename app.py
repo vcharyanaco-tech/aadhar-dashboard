@@ -7,6 +7,7 @@ Run:  streamlit run app.py
 import base64
 import hashlib
 import hmac
+import mimetypes
 import os
 import re
 import secrets
@@ -16,34 +17,141 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
+
+import kv_sync
+
+# plotly and openpyxl are imported on first use, not at module scope.
+#
+# The login page pays for every module-level import on a cold start, and Render's
+# free tier runs on a throttled shared CPU where that cost is several times
+# higher than on a workstation. Measured locally: streamlit 811 ms, pandas
+# 485 ms, openpyxl 166 ms, plotly 87 ms. plotly is only needed for the dashboard
+# charts and openpyxl only for the Excel exports, so neither is required to draw
+# a login form, and paying for both on every cold start was roughly a fifth of
+# the page's load time. pandas stays at module scope: parsers needs it, and
+# read_sql_query is on the main path.
+
+
+def _plotly():
+    global _px
+    if _px is None:
+        import plotly.express as px
+        _px = px
+    return _px
+
+
+def _excel_helpers():
+    global _excel
+    if _excel is None:
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+        _excel = (Font, get_column_letter)
+    return _excel
+
+
+_px = None
+_excel = None
+import parsers
+from parsers import (
+    date_from_filename,
+    describe_excluded,
+    norm_key,
+    parse_first_usable as read_file,
+    parse_label_date,
+    parse_master,
+    parse_operator_master,
+    parse_tx,
+    split_working_days,
+    target_table,
+)
 
 DATA_DIR = Path(os.environ.get("APP_DATA_DIR", "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB = DATA_DIR / "aadhaar.db"
 PBKDF2_ROUNDS = 200_000
 MAX_FAILS, LOCK_MINUTES = 5, 5
-DEFAULT_TEMP_PASSWORD = "Dop.1234"
-APP_NAME = "HARYANA CIRCLE  AADHAR MONITORING DASHBOARD"
-# Put the India Post logo in the same folder as app.py and name it logo.png (or logo.jpg)
-LOGO = next((p for n in ("logo.png", "logo.jpg", "logo.jpeg", "logo.webp")
+# The shared initial password for bulk-created division logins. It lives in the
+# environment, not in source: a credential committed to a public repository is
+# published even if the file is later edited, and this one is handed to every
+# division at once. Set AADHAR_DEFAULT_TEMP_PASSWORD on the host to keep using
+# the Circle's standard password; when it is unset a random password is
+# generated per batch instead of falling back to a shared default.
+DEFAULT_TEMP_PASSWORD = os.environ.get("AADHAR_DEFAULT_TEMP_PASSWORD") or ""
+# Idle logout in minutes. 0 disables it. Long enough not to interrupt a user
+# mid-report, short enough that an unattended station is not still signed in.
+SESSION_TIMEOUT_MINUTES = int(float(os.environ.get("SESSION_TIMEOUT_MINUTES") or 30))
+APP_NAME = "HARYANA CIRCLE AADHAR MONITORING DASHBOARD"
+# Put the India Post logo in the same folder as app.py, named logo.webp (or
+# .png/.jpg). WebP is preferred and logo.webp is the one shipped: logo.png is
+# 600x389 and the largest thing this app ever sends, but it is only ever
+# displayed at about 170px, so it was roughly 3x oversized. At 400px wide the
+# same image is 28 KB instead of 88 KB, and since the login page inlines it the
+# saving lands on every single render. logo.png is kept unmodified as the source
+# the webp was generated from.
+LOGO = next((p for n in ("logo.webp", "logo.png", "logo.jpg", "logo.jpeg")
              if (p := Path(__file__).parent / n).exists()), None)
+
+
+@st.cache_data(show_spinner=False)
+def _encode_logo(path_str, stamp):
+    """Encode the logo once. `stamp` is part of the cache key, so replacing
+    logo.png invalidates it without needing a manual cache clear."""
+    mime = mimetypes.guess_type(path_str)[0] or "image/png"
+    encoded = base64.b64encode(Path(path_str).read_bytes()).decode()
+    return f"data:{mime};base64,{encoded}"
+
+
+def logo_data_uri():
+    """The logo as a data URI, encoded once per process rather than per render.
+
+    It is ~88 KB on disk, which is ~118 KB once base64-encoded, and the login page
+    inlines it. Streamlit re-runs the whole script on every interaction, so
+    without this the same 118 KB was re-encoded on every single render.
+    """
+    if LOGO is None:
+        return None
+    stat = LOGO.stat()
+    return _encode_logo(str(LOGO), f"{stat.st_mtime_ns}-{stat.st_size}")
 
 st.set_page_config(page_title=APP_NAME, layout="wide")
 
 
 # ---------------------------------------------------------------- database
+_READ_ONLY_PREFIXES = ("SELECT", "PRAGMA", "WITH", "EXPLAIN")
+
+
+def _is_write(sql):
+    """True unless the statement is plainly a read.
+
+    `run()` used to commit unconditionally, so every SELECT took a write lock
+    and appended a WAL frame. There are dozens of reads per page render, so on a
+    throttled free-plan instance that was a meaningful cost for no benefit.
+    """
+    return not sql.lstrip().upper().startswith(_READ_ONLY_PREFIXES)
+
+
 def run(sql, args=(), one=False, many=False):
     con = sqlite3.connect(DB)
     try:
         con.row_factory = sqlite3.Row
         cur = con.execute(sql, args)
         out = cur.fetchone() if one else cur.fetchall() if many else None
-        con.commit()
+        if _is_write(sql):
+            con.commit()
         return out
     finally:
         con.close()
+
+
+def connect():
+    """A connection for the parsers module, which takes `con` rather than the path.
+
+    Row access by name is kept on because callers rely on sqlite3.Row.
+    """
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    return con
 
 
 def read_sql(sql, params=()):
@@ -68,12 +176,74 @@ def init_db():
     run("""CREATE TABLE IF NOT EXISTS camps(
         id INTEGER PRIMARY KEY AUTOINCREMENT, camp_date TEXT, division TEXT, sub_division TEXT,
         location TEXT, transactions INTEGER, remarks TEXT, created_by TEXT, created_at TEXT)""")
-    con = sqlite3.connect(DB)
+    run("""CREATE TABLE IF NOT EXISTS division_targets(
+        division TEXT PRIMARY KEY, daily_target INTEGER NOT NULL,
+        updated_by TEXT, updated_at TEXT)""")
+    run("""CREATE TABLE IF NOT EXISTS audit(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, username TEXT, action TEXT, detail TEXT)""")
+    con = connect()
     try:
-        ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0", "division": "TEXT"})
+        parsers.ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0", "division": "TEXT"})
+        # The report queries filter on tx.upload_id and join on tx.key; without
+        # these every page load is a full scan of a table that grows daily.
+        parsers.ensure_indexes(con)
+        parsers.ensure_audit_index_on(con)
         con.commit()
     finally:
         con.close()
+    seed_division_targets()
+
+
+def seed_division_targets():
+    """Copy the built-in targets into the table the first time it is empty.
+
+    Deliberately only on an empty table. Once an admin edits a target it is
+    theirs, and a later change to the constants in parsers.py must not silently
+    overwrite it - that would make a target look like it had been changed by
+    someone who did not change it.
+    """
+    if run("SELECT 1 FROM division_targets LIMIT 1", one=True):
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for division, target in parsers.DIVISION_DAILY_TARGETS.items():
+        run("INSERT OR IGNORE INTO division_targets(division, daily_target, updated_by, updated_at)"
+            " VALUES (?,?,?,?)", (division, target, "built-in", now))
+
+
+def daily_targets():
+    """Division -> daily target, from the database with the built-ins as a fallback.
+
+    Falls back to the constants so a division present in the master sheet but
+    absent from the table still gets measured rather than silently dropped from
+    the target comparison.
+    """
+    table = {}
+    for r in run("SELECT division, daily_target FROM division_targets", many=True):
+        table[r["division"]] = r["daily_target"]
+    merged = dict(parsers.DIVISION_DAILY_TARGETS)
+    merged.update(table)
+    return merged
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _target_lookup_cached():
+    """Cached so the lookup is not rebuilt from a table read on every render."""
+    return target_lookup()
+
+
+def target_lookup():
+    """Name-insensitive division -> daily target, for the target table."""
+    return {parsers.norm(k): v for k, v in daily_targets().items()}
+
+
+def audit(action, detail=""):
+    """Record an action in the audit log. Best-effort: never block the action."""
+    try:
+        user = st.session_state.get("user", {}).get("username", "system")
+        run("INSERT INTO audit(at, username, action, detail) VALUES (?,?,?,?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user, action, str(detail)[:500]))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- auth
@@ -98,14 +268,20 @@ def check_new_credentials(username, pw1, pw2, need_username=True):
 
 def add_user(username, password, role="user", must_change=0, division=None):
     salt, h = hash_pw(password)
-    run("INSERT INTO users(username, salt, pw_hash, role, created_at, must_change, division) VALUES (?,?,?,?,?,?,?)",
+    run("INSERT INTO users(username, salt, pw_hash, role, created_at, must_change, division)"
+        " VALUES (?,?,?,?,?,?,?)",
         (username, salt, h, role, datetime.now().strftime("%Y-%m-%d %H:%M"), must_change, division))
+    audit("user.create", f"{username} as {role}" + (f" ({division})" if division else ""))
+    kv_sync.request_backup()
 
 
 def set_password(username, password, must_change=0):
     salt, h = hash_pw(password)
     run("UPDATE users SET salt=?, pw_hash=?, fails=0, locked_until=NULL, must_change=? WHERE username=?",
         (salt, h, must_change, username))
+    # Never the password itself: the audit log is backed up off-site.
+    audit("user.password_change", username)
+    kv_sync.request_backup()
 
 
 def slugify_username(name):
@@ -115,26 +291,49 @@ def slugify_username(name):
     return s[:30]
 
 
-def bulk_create_division_users(default_password="Dop.1234"):
+def generate_temp_password():
+    """A readable random password for a batch of new logins.
+
+    12 characters from a pool that avoids visually ambiguous glyphs, so it can
+    be read aloud or copied off a screen. Satisfies the 8-character minimum.
+    """
+    pool = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(pool) for _ in range(12))
+
+
+def bulk_create_division_users(default_password=None):
     """Create one login per Division found in the master sheet.
-    Username = the division's name (slugified)."""
+
+    Username = the division's name (slugified). `default_password` defaults to
+    the configured shared password; when none is configured a single random
+    password is generated for the whole batch instead of a hardcoded fallback,
+    so the logins never share a credential that is published in the repository.
+    Returns (created, skipped) where each entry is (division, username).
+    """
     if not table_exists("master"):
-        return [], [], []
+        return [], []
+    password = default_password or DEFAULT_TEMP_PASSWORD or generate_temp_password()
     divs = read_sql("SELECT DISTINCT division FROM master WHERE division!='' ORDER BY division")
     existing = {r["username"] for r in run("SELECT username FROM users", many=True)}
-    created, renamed, skipped = [], [], []
+    created, skipped = [], []
     for division in divs["division"]:
         uname = slugify_username(division)
         if uname in existing:
-            # older logins created before division-linking: attach the division if still empty
-            run("UPDATE users SET division=? WHERE username=? AND role='user' AND (division IS NULL OR division='')",
+            # Logins created before division-linking have no division. Attach it
+            # now if the field is still empty, so they are not left locked out of
+            # camp entry. Never overwrite a division an admin set by hand.
+            run("UPDATE users SET division=? WHERE username=? AND role='user'"
+                " AND (division IS NULL OR division='')",
                 (division, uname))
             skipped.append((division, uname))
             continue
-        add_user(uname, default_password, "user", must_change=1, division=division)
+        add_user(uname, password, "user", must_change=1, division=division)
         existing.add(uname)
         created.append((division, uname))
-    return created, renamed, skipped
+    if created:
+        audit("user.bulk_create", f"{len(created)} division login(s): "
+                                  + ", ".join(u for _, u in created))
+    return created, skipped, password
 
 
 def authenticate(username, password):
@@ -162,7 +361,12 @@ def is_admin():
 
 
 def user_division():
-    """Division linked to the logged-in user (read fresh from the DB). None for admin / unlinked users."""
+    """The Division linked to the logged-in user, read fresh from the database.
+
+    Read fresh rather than from the session copy so that an admin changing a
+    user's division takes effect on their very next request, without needing a
+    re-login. Returns None for admins and for users with no division set.
+    """
     me = st.session_state.get("user", {})
     row = run("SELECT division FROM users WHERE username=?", (me.get("username", ""),), one=True)
     d = (row["division"] or "").strip() if row else ""
@@ -175,85 +379,8 @@ def flash(msg):
 
 
 # ---------------------------------------------------------------- file parsing
-def norm(s):
-    return re.sub(r"[^a-z0-9]", "", str(s).lower())
-
-
-def norm_key(v):
-    t = re.sub(r"\.0+$", "", str(v).strip().lower())
-    return t.lstrip("0") or ("0" if t else "")
-
-
-# Daily transaction target per division (Competent Authority approved targets).
-DIVISION_DAILY_TARGETS = {
-    "Hisar": 640, "Karnal": 880, "Faridabad": 620, "Sonipat": 280, "Bhiwani": 560,
-    "Kurukshetra": 520, "Rohtak": 560, "Gurgaon": 840, "Ambala": 1040,
-    "HR Division": 20, "D Division": 60,
-}
-_TARGET_LOOKUP = {norm(k): v for k, v in DIVISION_DAILY_TARGETS.items()}
-
-
-def daily_target_for(division):
-    """Daily target for a division name, matched ignoring case/spacing. None if not configured."""
-    return _TARGET_LOOKUP.get(norm(division))
-
-
-def find_col(cols, keys, exclude=()):
-    for k in keys:
-        for c in cols:
-            n = norm(c)
-            if k in n and not any(x in n for x in exclude):
-                return c
-    return None
-
-
-def exact_col(cols, name):
-    return next((c for c in cols if norm(c) == name), None)
-
-
-def to_num(series):
-    return pd.to_numeric(series.astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0)
-
-
-def date_from_filename(name):
-    """Look for a date in the uploaded file's name (e.g. '22.09.2026.xlsx' or '2026-09-22.xlsx')
-    and return it as 'DD-MM-YYYY', or None if no valid date is found."""
-    stem = Path(name).stem
-    m = re.search(r"(\d{2})[.\-_](\d{2})[.\-_](\d{4})", stem)  # DD.MM.YYYY / DD-MM-YYYY / DD_MM_YYYY
-    if m:
-        d, mo, y = m.groups()
-        try:
-            return datetime(int(y), int(mo), int(d)).strftime("%d-%m-%Y")
-        except ValueError:
-            pass
-    m = re.search(r"(\d{4})[.\-_](\d{2})[.\-_](\d{2})", stem)  # YYYY-MM-DD
-    if m:
-        y, mo, d = m.groups()
-        try:
-            return datetime(int(y), int(mo), int(d)).strftime("%d-%m-%Y")
-        except ValueError:
-            pass
-    m = re.search(r"(?<!\d)(\d{2})(\d{2})(\d{4})(?!\d)", stem)  # DDMMYYYY
-    if m:
-        d, mo, y = m.groups()
-        try:
-            return datetime(int(y), int(mo), int(d)).strftime("%d-%m-%Y")
-        except ValueError:
-            pass
-    return None
-
-
-def parse_label_date(label):
-    """Try to read an upload's label as a calendar date, for date-range filtering. Returns a date or None."""
-    label = (label or "").strip()
-    for fmt in ("%d-%m-%Y", "%d.%m.%Y", "%d/%m/%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(label, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-
+# The pure parsing work lives in parsers.py so it can be tested without
+# Streamlit. Only the UI that chooses which uploads to report on stays here.
 def sort_uploads_by_date_desc(uploads):
     """Sort uploads newest-first by their label's calendar date; uploads whose label isn't
     a recognisable date are kept at the end, newest id first."""
@@ -301,162 +428,88 @@ def select_period_ids(uploads, key_prefix):
     return [opts[s] for s in sel]
 
 
-def read_file(f, parser):
-    """Return parser(dataframe). For Excel files with several sheets, the first sheet that parses is used."""
-    if f.name.lower().endswith(".csv"):
-        sheets = {"CSV": pd.read_csv(f, dtype=str, keep_default_na=False)}
-    else:
-        sheets = pd.read_excel(f, dtype=str, keep_default_na=False, sheet_name=None)
-    errors = []
-    for name, df in sheets.items():
-        df.columns = [str(c).strip() for c in df.columns]
-        if df.empty:
-            errors.append(f"Sheet '{name}' is empty.")
-            continue
-        try:
-            return parser(df)
-        except ValueError as e:
-            errors.append(f"Sheet '{name}': {e}")
-    raise ValueError(" | ".join(errors))
+def _refuse_orphan_replace(summary):
+    """Veto hook for save_master: raise if replacing the master would orphan data.
+
+    The master is how every stored transaction row is mapped to a division, so a
+    replacement that drops station keys does not just add rows -- it makes
+    existing history invisible in the dashboard and the report, without appearing
+    in the "not in master" list either. Blocking here turns silent data loss into
+    a message the admin has to acknowledge.
+    """
+    raise ValueError(
+        f"This master sheet would leave {summary['orphaned_keys']} station(s) already "
+        f"recorded in the transaction history with no master entry. Their data would stop "
+        f"appearing in the dashboard and reports. Sample: {', '.join(summary['sample'])}. "
+        f"Upload the complete master, or clear the existing transaction uploads first.")
 
 
-def pick(df, spec):
-    cols = list(df.columns)
-    found = {name: find_col(cols, keys) for name, keys in spec.items()}
-    missing = [n for n, c in found.items() if c is None]
-    if missing:
-        raise ValueError(f"Column not found: {', '.join(missing)}. Headers in your file: {', '.join(cols)}")
-    return found
+def replace_master(m, confirm_orphans=False):
+    """Replace the master table, refusing by default if it would orphan history.
 
-
-def parse_master(df):
-    c = pick(df, {"Station Number": ["stationno", "stationnumber", "station"],
-                  "Office ID": ["officeid", "office"]})
-    cols = list(df.columns)
-    # also accepts the misspelt header "Divison"
-    dv = next((x for x in cols if ("division" in norm(x) or "divison" in norm(x)) and "sub" not in norm(x)), None)
-    sd = next((x for x in cols if "subdiv" in norm(x)), None)
-    if dv is None:
-        raise ValueError(f"Column not found: Division. Headers in your file: {', '.join(cols)}")
-    a, d = find_col(cols, ["address"]), find_col(cols, ["district"])
-
-    def text(col):
-        return df[col].str.strip() if col else ""
-
-    m = pd.DataFrame({"station": text(c["Station Number"]), "office_id": text(c["Office ID"]),
-                      "division": text(dv), "sub_division": text(sd), "address": text(a), "district": text(d)})
-    m["key"] = m["station"].map(norm_key)
-    m = m[m["key"] != ""].replace("", pd.NA)
-    # a station may appear on several rows: keep the first filled value of every column
-    m = m.groupby("key", as_index=False, sort=False).first().fillna("")
-    # unify spellings such as "HIsar" and "Hisar" (most common spelling wins)
-    for col in ("division", "sub_division"):
-        spell = m[m[col] != ""].groupby(m[col].str.lower())[col].agg(lambda s: s.value_counts().idxmax())
-        m[col] = m[col].str.lower().map(spell).fillna("")
-    return m
-
-
-def parse_tx(df):
-    cols = list(df.columns)
-    s = find_col(cols, ["stationno", "stationnumber", "station"])
-    e = find_col(cols, ["newenrol", "enrol"]) or exact_col(cols, "countn")
-    tot = find_col(cols, ["countuplusnplusz", "totaltransaction", "countuplusn"])
-    mb = find_col(cols, ["ismbu", "mbu", "mandatorybiometric"], exclude=("non",))
-    nm = find_col(cols, ["nonmbu"])
-    dm = find_col(cols, ["demoupdate", "demographic", "demo"])
-    up = find_col(cols, ["numberofupdation", "updation"])
-    op = find_col(cols, ["sessionoperatorid", "operatorid", "operatorname", "operator"])
-    if not s or not e or not (tot or mb or dm or nm or up):
-        raise ValueError("Required columns: station_number, Count_N, and Count_U_plus_N_plus_Z "
-                         "(or Count_U_plus_N / IS_MBU / NON_MBU / DEMO_UPDATE). "
-                         f"Headers in your file: {', '.join(cols)}")
-    a, d = find_col(cols, ["address"]), find_col(cols, ["district"])
-    dv = next((x for x in cols if "division" in norm(x) and "sub" not in norm(x)), None)
-    sd = next((x for x in cols if "subdiv" in norm(x)), None)
-
-    def text(c):
-        return df[c].str.strip() if c else ""
-
-    enr = to_num(df[e])
-    mbu = to_num(df[mb]) if mb else 0.0
-    demo = to_num(df[dm]) if dm else 0.0
-    non = to_num(df[nm]) if nm else 0.0
-    if tot:  # Total transactions from the sheet is the source of truth; updates = Total - New
-        upd = (to_num(df[tot]) - enr).clip(lower=0)
-    elif mb or dm or nm:
-        upd = mbu + demo + non
-    else:
-        upd = to_num(df[up])
-    t = pd.DataFrame({"station": df[s].str.strip(), "address": text(a), "district": text(d),
-                      "t_div": text(dv), "t_sub": text(sd), "operator": text(op), "enr": enr, "mbu": mbu,
-                      "demo": demo, "nonmbu": non, "upd": upd})
-    t["key"] = t["station"].map(norm_key)
-    return t[t["key"] != ""]
-
-
-def save_master(m):
-    con = sqlite3.connect(DB)
+    Returns a summary dict. Set `confirm_orphans` to proceed despite the warning.
+    """
+    con = connect()
     try:
-        m.to_sql("master", con, if_exists="replace", index=False)
-    finally:
-        con.close()
-
-
-def parse_operator_master(df):
-    """Operator master: Operator ID + Operator Name (any extra columns are ignored)."""
-    cols = list(df.columns)
-    oid = find_col(cols, ["sessionoperatorid", "operatorid", "operatorcode", "userid", "employeeid", "empid"],
-                   exclude=("name",))
-    if oid is None:  # header such as just "Operator" or "ID"
-        oid = find_col(cols, ["operator", "id"], exclude=("name",))
-    nm = find_col(cols, ["operatorname", "employeename", "username", "name"])
-    if oid is None or nm is None or oid == nm:
-        raise ValueError("Required columns: Operator ID and Operator Name. "
-                         f"Headers in your file: {', '.join(cols)}")
-    m = pd.DataFrame({"operator_id": df[oid].astype(str).str.strip(),
-                      "operator_name": df[nm].astype(str).str.strip()})
-    m["op_key"] = m["operator_id"].map(norm_key)
-    m = m[m["op_key"] != ""].replace("", pd.NA)
-    # an operator may appear on several rows: keep the first filled name
-    m = m.groupby("op_key", as_index=False, sort=False).first().fillna("")
-    return m[["op_key", "operator_id", "operator_name"]]
-
-
-def save_operator_master(m):
-    con = sqlite3.connect(DB)
-    try:
-        m.to_sql("operator_master", con, if_exists="replace", index=False)
-    finally:
-        con.close()
-
-
-def operator_names():
-    """Series of operator_name indexed by normalised operator key (empty if no operator master)."""
-    if not table_exists("operator_master"):
-        return pd.Series(dtype=str)
-    om = read_sql("SELECT op_key, operator_name FROM operator_master")
-    return om.drop_duplicates("op_key").set_index("op_key")["operator_name"]
-
-
-def ensure_cols(con, table, wanted):
-    have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
-    if have:
-        for name, typ in wanted.items():
-            if name not in have:
-                con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
-
-
-def save_tx(t, label, by):
-    con = sqlite3.connect(DB)
-    try:
-        cur = con.execute("INSERT INTO uploads(label, uploaded_by, uploaded_at) VALUES (?,?,?)",
-                          (label, by, datetime.now().strftime("%Y-%m-%d %H:%M")))
-        ensure_cols(con, "tx", {"mbu": "REAL", "demo": "REAL", "nonmbu": "REAL", "t_div": "TEXT", "t_sub": "TEXT",
-                                "operator": "TEXT"})
-        t.assign(upload_id=cur.lastrowid).to_sql("tx", con, if_exists="append", index=False)
+        summary = parsers.save_master(con, m, on_replace=None if confirm_orphans else _refuse_orphan_replace)
         con.commit()
     finally:
         con.close()
+    clear_report_cache()
+    audit("master.replace", f"{summary['incoming']} stations in, "
+                            f"{summary['orphaned']} previously-seen key(s) orphaned"
+                            + (", OVERRIDDEN" if confirm_orphans else ""))
+    kv_sync.request_backup()
+    return summary
+
+
+def clear_report_cache():
+    """Drop the cached report aggregates.
+
+    Only master, tx and operator_master affect them, so the users/camps tables
+    deliberately do not clear this. The TTL is a safety net, not the mechanism:
+    an admin uploading a sheet should see it immediately, not after five minutes.
+    """
+    try:
+        build_period.clear()
+    except Exception:
+        pass
+
+
+def save_operator_master(m):
+    con = connect()
+    try:
+        n = parsers.save_operator_master(con, m)
+        con.commit()
+    finally:
+        con.close()
+    clear_report_cache()
+    audit("operator_master.replace", f"{n} operators")
+    kv_sync.request_backup()
+    return n
+
+
+def operator_names():
+    """operator_name indexed by normalised key, deterministically tie-broken."""
+    con = connect()
+    try:
+        return parsers.operator_names(con)
+    finally:
+        con.close()
+
+
+def save_tx(t, label, by):
+    """Append one day's transactions. Rejects a frame that breaks the column contract."""
+    con = connect()
+    try:
+        upload_id = parsers.save_tx(con, t, label, by)
+        con.commit()
+    finally:
+        con.close()
+    clear_report_cache()
+    audit("tx.upload", f"{label}: {len(t)} rows")
+    kv_sync.request_backup()
+    return upload_id
 
 
 # ---------------------------------------------------------------- camps
@@ -480,6 +533,8 @@ def save_camp(camp_date, division, sub_division, location, transactions, remarks
         VALUES (?,?,?,?,?,?,?,?)""",
         (camp_date, division, sub_division, location, transactions, remarks, by,
          datetime.now().strftime("%Y-%m-%d %H:%M")))
+    audit("camp.create", f"{camp_date} {division}/{sub_division} {location} ({transactions})")
+    kv_sync.request_backup()
 
 
 # ---------------------------------------------------------------- screens
@@ -523,10 +578,9 @@ LOGIN_CSS = """<style>
 def login_screen():
     st.markdown(LOGIN_CSS, unsafe_allow_html=True)
     plate = ""
-    if LOGO:
-        mime = "image/jpeg" if LOGO.suffix.lower() in (".jpg", ".jpeg") else f"image/{LOGO.suffix[1:].lower()}"
-        b64 = base64.b64encode(LOGO.read_bytes()).decode()
-        plate = f'<div class="hp-plate"><img src="data:{mime};base64,{b64}" alt="India Post"></div><br>'
+    uri = logo_data_uri()
+    if uri:
+        plate = f'<div class="hp-plate"><img src="{uri}" alt="India Post"></div><br>'
     st.markdown(f'<div class="hp-band">{plate}<div class="hp-title">Aadhaar MIS Dashboard<br>'
                 'Department of Posts, India<br>Haryana Circle</div></div>', unsafe_allow_html=True)
     with st.form("login"):
@@ -536,6 +590,7 @@ def login_screen():
             user, err = authenticate(u, p)
             if user:
                 st.session_state["user"] = user
+                st.session_state["last_seen"] = datetime.now()
                 st.rerun()
             st.error(err)
     st.markdown('<div class="hp-pills"><div class="hp-pill">Live Dashboard</div>'
@@ -602,7 +657,7 @@ def dashboard():
     if not ids:
         return
 
-    agg, missing, m = build_stations(ids)
+    agg, missing, m, _ = build_period(ids)
 
     f1, f2, f3 = st.columns([1, 1, 2])
     dv = f1.selectbox("Division", ["All"] + sorted(set(agg["division"]) | set(m["division"])))
@@ -633,33 +688,50 @@ def dashboard():
             "New enrolment", "MBU", "Demographic updates", "Non-MBU", "Updates", "Total"]
     show = show[cols].sort_values("Total", ascending=False)
 
-    period_days = len(ids)
-    tgt = show.groupby("Division")["Total"].sum().reset_index().rename(columns={"Total": "Achievement"})
-    tgt["Daily Target"] = tgt["Division"].map(daily_target_for)
-    no_target = sorted(tgt.loc[tgt["Daily Target"].isna(), "Division"])
-    tgt = tgt.dropna(subset=["Daily Target"])
-    if len(tgt):
-        tgt["Target"] = (tgt["Daily Target"] * period_days).astype(int)
-        tgt["Achievement"] = tgt["Achievement"].astype(int)
-        tgt["Shortfall / Surplus"] = tgt["Achievement"] - tgt["Target"]
-        tgt["% Achieved"] = (tgt["Achievement"] / tgt["Target"] * 100).round(1)
+    # The target is Daily Target x the number of *working* days selected, not
+    # the number of uploads. Divisional offices are closed on Sundays, so
+    # counting a Sunday as a full day of opportunity understates achievement -
+    # by 12 points for Hisar across 18-24 September 2026. Sunday transactions
+    # that did happen (RMS and delivery branches) still count as achievement.
+    label_by_id = {r["id"]: r["label"] for r in uploads}
+    period_days, excluded, unknown_dates = split_working_days(
+        [parse_label_date(label_by_id.get(i)) for i in ids])
+    achievement = show.groupby("Division")["Total"].sum().reset_index()
+    tgt, no_target = target_table(achievement, period_days, _target_lookup_cached())
+    if len(tgt) and period_days > 0:
+        if period_days <= 0:
+            # Every selected day is a non-working day. A target of zero would
+            # make the percentage meaningless, so say so rather than divide.
+            st.subheader("Target vs Achievement")
+            st.warning(
+                "Every day in the selected period is a non-working day, so there is no "
+                "target to measure against. Transactions from those days are still "
+                "shown in the station details below. "
+                + describe_excluded(excluded))
+        else:
+            st.subheader("Target vs Achievement")
+            st.caption(
+                f"Target = Daily Target x {period_days} working day(s) selected above "
+                f"({len(ids)} upload(s) in total). "
+                "Achievement = actual transactions in the same period, for the divisions "
+                "currently in view."
+                + ((" " + describe_excluded(excluded)) if excluded else "")
+                + (f" {unknown_dates} upload label(s) could not be read as a date and "
+                   "were counted as working days." if unknown_dates else ""))
+            fig_t = _plotly().bar(tgt.melt("Division", value_vars=["Target", "Achievement"],
+                                    var_name="Type", value_name="Count"),
+                           x="Division", y="Count", color="Type", barmode="group", text="Count",
+                           color_discrete_map={"Target": "#B0B0B0", "Achievement": "#7A1F2B"},
+                           title="Target vs Achievement (transactions)")
+            fig_t.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
+            st.plotly_chart(fig_t, use_container_width=True)
 
-        st.subheader("Target vs Achievement")
-        st.caption(f"Target = Daily Target x {period_days} working day(s) selected above. "
-                   "Achievement = actual transactions in the same period, for the divisions currently in view.")
-        fig_t = px.bar(tgt.melt("Division", value_vars=["Target", "Achievement"],
-                                var_name="Type", value_name="Count"),
-                       x="Division", y="Count", color="Type", barmode="group", text="Count",
-                       color_discrete_map={"Target": "#B0B0B0", "Achievement": "#7A1F2B"},
-                       title="Target vs Achievement (transactions)")
-        fig_t.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
-        st.plotly_chart(fig_t, use_container_width=True)
-
-        tshow = tgt[["Division", "Target", "Achievement", "Shortfall / Surplus", "% Achieved"]] \
-            .sort_values("Division")
-        st.dataframe(tshow, hide_index=True, use_container_width=True)
-        st.download_button("Download Target vs Achievement CSV", tshow.to_csv(index=False).encode("utf-8-sig"),
-                           "target_vs_achievement.csv", "text/csv", key="dl_target_vs_ach")
+            tshow = tgt[["Division", "Target", "Achievement", "Shortfall / Surplus", "% Achieved"]] \
+                .sort_values("Division")
+            st.dataframe(tshow, hide_index=True, use_container_width=True)
+            st.download_button("Download Target vs Achievement CSV",
+                               tshow.to_csv(index=False).encode("utf-8-sig"),
+                               "target_vs_achievement.csv", "text/csv", key="dl_target_vs_ach")
         if no_target:
             st.caption("No target configured for: " + ", ".join(no_target))
     else:
@@ -667,7 +739,7 @@ def dashboard():
 
     st.divider()
     d = show.groupby("Division")[["New enrolment", "Updates"]].sum().reset_index()
-    fig_d = px.bar(d.melt("Division", var_name="Type", value_name="Count"), x="Division", y="Count",
+    fig_d = _plotly().bar(d.melt("Division", var_name="Type", value_name="Count"), x="Division", y="Count",
                    color="Type", barmode="stack", text="Count", title="Division-wise transactions")
     fig_d.update_traces(texttemplate="%{text:,.0f}", textposition="inside")
     st.plotly_chart(fig_d, use_container_width=True)
@@ -693,7 +765,7 @@ def operator_analysis_tab():
     if not ids:
         return
 
-    ops = build_operators(ids)
+    _, _, _, ops = build_period(ids)
     if ops.empty:
         st.info("No operator data found for the selected period. Make sure the daily upload file has "
                 "a Session Operator ID (or Operator ID) column.")
@@ -736,7 +808,7 @@ def operator_analysis_tab():
     top = show.head(20).copy()
     top["Operator"] = top.apply(
         lambda r: f"{r['Operator Name']} ({r['Operator ID']})" if r["Operator Name"] else r["Operator ID"], axis=1)
-    fig = px.bar(top, x="Operator", y="Total", color="Division", text="Total",
+    fig = _plotly().bar(top, x="Operator", y="Total", color="Division", text="Total",
                 title="Top 20 operators by total transactions")
     fig.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
     st.plotly_chart(fig, use_container_width=True)
@@ -758,10 +830,19 @@ def upload_tab():
     st.subheader("Master sheet")
     st.caption("Master headers: station_number, Office Id, Sub Division Name, Divison (or Division). "
                "machine_address and Machine District are optional. A new upload replaces the existing master.")
+    # Set when a parsed master is rejected for orphaning history; the operator
+    # then re-submits with the acknowledgement checkbox.
+    force_master = st.session_state.get("force_master_replace", False)
     with st.form("master_form", clear_on_submit=True):
         f = st.file_uploader("Master file", type=["xlsx", "xls", "csv"], key="master_uploader")
         if f is not None:
             st.caption(f"Selected file: **{f.name}** ({f.size / 1024:.1f} KB) - ready to save.")
+        if st.session_state.get("master_orphan_warning"):
+            st.warning(st.session_state["master_orphan_warning"])
+            force_master = st.checkbox(
+                "I understand: replace the master anyway and orphan the listed history",
+                key="force_master_replace",
+                value=False)
         if st.form_submit_button("Save master"):
             if not f:
                 st.warning("No file detected. Please choose the file again, wait until its name "
@@ -770,8 +851,19 @@ def upload_tab():
             else:
                 try:
                     mm = read_file(f, parse_master)
-                    save_master(mm)
+                    replace_master(mm, confirm_orphans=force_master)
+                    st.session_state.pop("master_orphan_warning", None)
+                    st.session_state["force_master_replace"] = False
                     flash(f"Master saved: {len(mm)} stations.")
+                except ValueError as e:
+                    # Distinguish "this file is unparseable" from "this file would
+                    # destroy history"; only the latter can be acknowledged.
+                    msg = str(e)
+                    if "no master entry" in msg:
+                        st.session_state["master_orphan_warning"] = msg
+                        st.session_state["force_master_replace"] = False
+                        st.rerun()
+                    st.error(msg)
                 except Exception as e:
                     st.error(str(e))
 
@@ -845,8 +937,13 @@ def upload_tab():
         pick_id = st.selectbox("Delete an upload", [r["id"] for r in ups],
                                format_func=lambda i: next(r["label"] for r in ups if r["id"] == i))
         if st.button("Delete selected upload"):
+            label = next((r["label"] for r in ups if r["id"] == pick_id), str(pick_id))
+            n_rows = run("SELECT COUNT(*) n FROM tx WHERE upload_id=?", (pick_id,), one=True)["n"]
             run("DELETE FROM tx WHERE upload_id=?", (pick_id,))
             run("DELETE FROM uploads WHERE id=?", (pick_id,))
+            audit("tx.delete", f"upload '{label}' (#{pick_id}) and {n_rows} transaction row(s)")
+            clear_report_cache()
+            kv_sync.request_backup()
             flash("Upload deleted.")
 
 
@@ -857,24 +954,88 @@ def users_tab():
     me = st.session_state["user"]["username"]
 
     st.subheader("Bulk create Division logins")
-    st.caption("Creates one login per Division found in the master sheet. The username is generated "
-               f"from the division's name, the default password for all of them is \"{DEFAULT_TEMP_PASSWORD}\", "
-               "and the user must set a new password on first login.")
+    if DEFAULT_TEMP_PASSWORD:
+        st.caption("Creates one login per Division found in the master sheet. The username is generated "
+                   "from the division's name, the default password for all of them is "
+                   f"\"{DEFAULT_TEMP_PASSWORD}\", and the user must set a new password on first login.")
+    else:
+        st.caption("Creates one login per Division found in the master sheet. The username is generated "
+                   "from the division's name. No shared default password is configured, so a random "
+                   "password is generated for the batch and shown once below. Every user must set a "
+                   "new password on first login.")
     if not table_exists("master"):
         st.info("Please upload the master sheet from the Upload data tab first.")
     elif st.button("Create logins for all Divisions"):
-        created, renamed, skipped = bulk_create_division_users(DEFAULT_TEMP_PASSWORD)
+        created, skipped, password = bulk_create_division_users()
         if created:
-            st.success(f"{len(created)} login(s) created. Default password: {DEFAULT_TEMP_PASSWORD} "
-                       "(must be changed on first login).")
+            st.success(f"{len(created)} login(s) created. Temporary password for this batch: "
+                       f"**{password}** (must be changed on first login).")
             st.dataframe(pd.DataFrame(created, columns=["Division", "Username"]),
-                        hide_index=True, use_container_width=True)
+                         hide_index=True, use_container_width=True)
         if skipped:
             st.info(f"{len(skipped)} division(s) already had a login, so they were skipped.")
             st.dataframe(pd.DataFrame(skipped, columns=["Division", "Username"]),
-                        hide_index=True, use_container_width=True)
+                         hide_index=True, use_container_width=True)
         if not created and not skipped:
             st.info("No Division found in the master sheet.")
+
+    st.divider()
+    st.subheader("Daily targets")
+    st.caption("Competent Authority approved daily transaction target per division. "
+               "These decide the Target column on the dashboard. Editing one takes "
+               "effect immediately; it is recorded in the activity log below.")
+    known = daily_targets()
+    if table_exists("master"):
+        for d in get_divisions():
+            known.setdefault(d, parsers.DIVISION_DAILY_TARGETS.get(d))
+    with st.form("targets_form"):
+        st.caption(f"Configured: {len(parsers.DIVISION_DAILY_TARGETS)} built-in. "
+                   "Leave blank for a division with no approved target.")
+        cols = st.columns(4)
+        new_targets = {}
+        for i, division in enumerate(sorted(known)):
+            with cols[i % 4]:
+                current = known.get(division)
+                new_targets[division] = st.number_input(
+                    division, min_value=0, value=int(current) if current else 0,
+                    step=10, key=f"tgt_{division}", format="%d")
+        if st.form_submit_button("Save targets"):
+            changed = []
+            for division, value in new_targets.items():
+                value = int(value)
+                before = known.get(division)
+                if before != value:
+                    run("INSERT INTO division_targets(division, daily_target, updated_by, updated_at)"
+                        " VALUES (?,?,?,?) ON CONFLICT(division) DO UPDATE SET"
+                        " daily_target=excluded.daily_target, updated_by=excluded.updated_by,"
+                        " updated_at=excluded.updated_at",
+                        (division, value, st.session_state["user"]["username"],
+                         datetime.now().strftime("%Y-%m-%d %H:%M")))
+                    changed.append(f"{division}: {before if before is not None else 'none'} -> {value}")
+            if changed:
+                audit("targets.update", "; ".join(changed))
+                kv_sync.request_backup()
+                flash(f"Saved {len(changed)} target change(s).")
+            else:
+                st.info("No changes.")
+
+    st.divider()
+    st.subheader("Activity log")
+    st.caption("Every upload, deletion, user change and rollback, with who did it. "
+               "Kept permanently and backed up with the rest of the database.")
+    limit = st.number_input("Show latest", min_value=20, max_value=1000, value=100, step=20,
+                            key="audit_limit")
+    logs = read_sql("SELECT at, username, action, detail FROM audit ORDER BY id DESC LIMIT ?",
+                    (int(limit),))
+    if logs.empty:
+        st.info("Nothing recorded yet. Actions taken from now on will appear here.")
+    else:
+        show_log = logs.rename(columns={"at": "When", "username": "Who",
+                                        "action": "Action", "detail": "Detail"})
+        st.dataframe(show_log, hide_index=True, use_container_width=True)
+        st.download_button("Download activity log CSV",
+                           show_log.to_csv(index=False).encode("utf-8-sig"),
+                           "aadhar_activity_log.csv", "text/csv", key="audit_dl")
 
     st.divider()
     st.subheader("Create user login")
@@ -887,11 +1048,13 @@ def users_tab():
             if err:
                 st.error(err)
             else:
-                add_user(u, p, "user", must_change=1, division=None if dv_new == "(none)" else dv_new)
+                add_user(u, p, "user", must_change=1,
+                         division=None if dv_new == "(none)" else dv_new)
                 flash(f"User '{u}' created. Share the username and password with them - "
                      "they will need to set a new password on first login.")
 
-    users = read_sql("SELECT username, role, division, active, created_at FROM users ORDER BY role, username")
+    users = read_sql("SELECT username, role, division, active, created_at FROM users"
+                     " ORDER BY role, username")
     st.dataframe(users.assign(active=users["active"].map({1: "Yes", 0: "No"}),
                               division=users["division"].fillna("")).rename(columns={
         "username": "Username", "role": "Role", "division": "Division", "active": "Active",
@@ -916,97 +1079,70 @@ def users_tab():
     with rc2:
         st.write("")
         st.write("")
-        if st.button(f"Reset to default password ({DEFAULT_TEMP_PASSWORD})"):
-            set_password(target, DEFAULT_TEMP_PASSWORD, must_change=1)
-            st.success(f"Password reset to {DEFAULT_TEMP_PASSWORD} for {target}. "
-                      "They will need to set a new password on first login.")
+        # Only offered when a shared default is actually configured; otherwise
+        # there is nothing to reset to, and offering it would lock the user out.
+        if DEFAULT_TEMP_PASSWORD:
+            if st.button(f"Reset to default password ({DEFAULT_TEMP_PASSWORD})"):
+                set_password(target, DEFAULT_TEMP_PASSWORD, must_change=1)
+                st.success(f"Password reset to {DEFAULT_TEMP_PASSWORD} for {target}. "
+                           "They will need to set a new password on first login.")
     row = users[users["username"] == target].iloc[0]
     divs = get_divisions()
     cur_div = row["division"] if isinstance(row["division"], str) else ""
     opts_div = ["(none)"] + divs
     d1, d2 = st.columns([2, 1])
     new_div = d1.selectbox("Division of selected user (camp entry rights)", opts_div,
-                           index=opts_div.index(cur_div) if cur_div in opts_div else 0, key="assign_div")
+                           index=opts_div.index(cur_div) if cur_div in opts_div else 0,
+                           key="assign_div")
     d2.write("")
     d2.write("")
     if d2.button("Save division"):
-        run("UPDATE users SET division=? WHERE username=?", (None if new_div == "(none)" else new_div, target))
+        run("UPDATE users SET division=? WHERE username=?",
+            (None if new_div == "(none)" else new_div, target))
+        audit("user.set_division", f"{target} -> {new_div}")
+        kv_sync.request_backup()
         flash(f"Division updated for {target}.")
     a, b = st.columns(2)
     if a.button("Disable login" if row["active"] else "Enable login"):
         run("UPDATE users SET active=? WHERE username=?", (0 if row["active"] else 1, target))
+        audit("user.disable" if row["active"] else "user.enable", target)
+        kv_sync.request_backup()
         flash("User updated.")
     with b:
         sure = st.checkbox("Confirm delete")
         if st.button("Delete user") and sure:
             run("DELETE FROM users WHERE username=?", (target,))
+            audit("user.delete", target)
+            kv_sync.request_backup()
             flash(f"User '{target}' deleted.")
 
 
-def build_stations(ids):
-    """Station-wise totals for the selected upload ids, joined with the master sheet."""
-    m = read_sql("SELECT * FROM master")
-    for c in ("sub_division", "address", "district"):
-        if c not in m.columns:
-            m[c] = ""
-    t = read_sql(f"SELECT * FROM tx WHERE upload_id IN ({','.join('?' * len(ids))})", tuple(ids))
-    for c in ("mbu", "demo", "nonmbu"):
-        t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0) if c in t.columns else 0.0
-    for c in ("t_div", "t_sub", "address", "district"):
-        t[c] = t[c].fillna("").astype(str) if c in t.columns else ""
-    agg = t.groupby("key", as_index=False).agg(
-        station=("station", "first"), district=("district", "first"), address=("address", "first"),
-        t_div=("t_div", "first"), t_sub=("t_sub", "first"), machines=("key", "size"),
-        days_reported=("upload_id", "nunique"),
-        enr=("enr", "sum"), mbu=("mbu", "sum"), demo=("demo", "sum"), nonmbu=("nonmbu", "sum"),
-        upd=("upd", "sum"))
-    agg["total"] = agg["enr"] + agg["upd"]
-    mm = m[["key", "office_id", "division", "sub_division"]].assign(m_addr=m["address"], m_dist=m["district"])
-    agg = agg.merge(mm, on="key", how="left")
-
-    def first_filled(a, b, default):
-        a, b = a.fillna("").astype(str).str.strip(), b.fillna("").astype(str).str.strip()
-        return a.where(a != "", b.where(b != "", default))
-
-    agg["division"] = first_filled(agg["division"], agg["t_div"], "Not in master")
-    agg["sub_division"] = first_filled(agg["sub_division"], agg["t_sub"], "Not mapped")
-    agg["office_id"] = agg["office_id"].fillna("")
-    agg["address"] = first_filled(agg["address"], agg["m_addr"], "")
-    agg["district"] = first_filled(agg["district"], agg["m_dist"], "")
-    return agg, m[~m["key"].isin(agg["key"])], m
+# Columns the report builders need. Selecting them explicitly rather than `*`
+# keeps a schema change from silently widening every report query, and lets the
+# covering index on (key, upload_id) do the work.
+_STATION_TX_COLS = ["key", "station", "district", "address", "t_div", "t_sub", "upload_id",
+                    "enr", "mbu", "demo", "nonmbu", "upd"]
+_MASTER_COLS = ["key", "station", "office_id", "division", "sub_division", "address", "district"]
 
 
-def build_operators(ids):
-    """Operator-wise totals for the selected upload ids. Each operator is mapped to the
-    division / sub-division of the stations they reported from (most frequent one)."""
-    agg, _, _ = build_stations(ids)
-    key_div = agg.set_index("key")[["division", "sub_division"]]
+OPERATOR_EMPTY_COLS = ["operator", "operator_name", "division", "sub_division", "stations",
+                       "days_worked", "enr", "mbu", "demo", "nonmbu", "upd", "total"]
 
-    t = read_sql(f"SELECT * FROM tx WHERE upload_id IN ({','.join('?' * len(ids))})", tuple(ids))
-    empty = pd.DataFrame(columns=["operator", "operator_name", "division", "sub_division", "stations", "days_worked",
-                                  "enr", "mbu", "demo", "nonmbu", "upd", "total"])
-    if "operator" not in t.columns:
-        return empty
-    t["operator"] = t["operator"].fillna("").astype(str).str.strip()
-    t = t[t["operator"] != ""]
-    if t.empty:
-        return empty
-    for c in ("mbu", "demo", "nonmbu"):
-        t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0) if c in t.columns else 0.0
-    t = t.join(key_div, on="key")
-    t["division"] = t["division"].fillna("Not in master")
-    t["sub_division"] = t["sub_division"].fillna("Not mapped")
 
-    def mode(s):
-        return s.value_counts().idxmax()
+@st.cache_data(ttl=300, show_spinner=False)
+def build_period(ids):
+    """Cached wrapper around parsers.aggregate_period.
 
-    op = t.groupby("operator", as_index=False).agg(
-        division=("division", mode), sub_division=("sub_division", mode),
-        stations=("key", "nunique"), days_worked=("upload_id", "nunique"),
-        enr=("enr", "sum"), mbu=("mbu", "sum"), demo=("demo", "sum"), nonmbu=("nonmbu", "sum"), upd=("upd", "sum"))
-    op["total"] = op["enr"] + op["upd"]
-    op["operator_name"] = op["operator"].map(norm_key).map(operator_names()).fillna("")
-    return op
+    The aggregation itself lives in parsers.py so it can be tested without a
+    Streamlit runtime. This only adds the cache, which is keyed on the selected
+    upload ids; `clear_report_cache()` runs on the writes that change master or
+    transaction data, and the TTL is a backstop rather than the mechanism.
+    """
+    con = connect()
+    try:
+        return parsers.aggregate_period(con, tuple(ids))
+    finally:
+        con.close()
 
 
 REPORT_COLS = ["Division Name", "Sub Division Name", "Total Transactions", "New Enrollments", "MBU",
@@ -1014,7 +1150,6 @@ REPORT_COLS = ["Division Name", "Sub Division Name", "Total Transactions", "New 
 
 
 def report_tab():
-    from openpyxl.styles import Font
     uploads = run("SELECT * FROM uploads ORDER BY id DESC", many=True)
     if not table_exists("master") or not uploads:
         st.info("Data has not been uploaded yet. Please contact the admin.")
@@ -1024,7 +1159,9 @@ def report_tab():
     if not ids:
         return
 
-    agg_full, missing, _ = build_stations(ids)
+    # One call gives both the station and operator aggregates from a single
+    # read of master and tx.
+    agg_full, missing, _, ops = build_period(ids)
     not_in_master = agg_full[agg_full["division"] == "Not in master"]
     st.caption(f"Stations in daily data: {len(agg_full)} | not found in master: "
                f"{len(not_in_master)} | master stations with no data: {len(missing)}")
@@ -1081,9 +1218,9 @@ def report_tab():
         out.to_excel(w, index=False, sheet_name="Report")
         ws = w.sheets["Report"]
         for i, c in enumerate(out.columns, 1):
-            ws.column_dimensions[chr(64 + i)].width = max(len(c), int(out[c].astype(str).str.len().max())) + 3
+            ws.column_dimensions[_excel_helpers()[1](i)].width = max(len(c), int(out[c].astype(str).str.len().max())) + 3
         for cell in ws[1] + ws[ws.max_row]:
-            cell.font = Font(bold=True)
+            cell.font = _excel_helpers()[0](bold=True)
     a, b = st.columns(2)
     a.download_button("Download Excel", buf.getvalue(), "haryana_circle_report.xlsx",
                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1107,9 +1244,9 @@ def report_tab():
         out2.to_excel(w, index=False, sheet_name="Division Consolidated")
         ws2 = w.sheets["Division Consolidated"]
         for i, c in enumerate(out2.columns, 1):
-            ws2.column_dimensions[chr(64 + i)].width = max(len(c), int(out2[c].astype(str).str.len().max())) + 3
+            ws2.column_dimensions[_excel_helpers()[1](i)].width = max(len(c), int(out2[c].astype(str).str.len().max())) + 3
         for cell in ws2[1] + ws2[ws2.max_row]:
-            cell.font = Font(bold=True)
+            cell.font = _excel_helpers()[0](bold=True)
     c1, c2 = st.columns(2)
     c1.download_button("Download Division-wise Excel", buf2.getvalue(), "haryana_circle_division_consolidated.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1120,7 +1257,6 @@ def report_tab():
     st.subheader("Operator-wise Consolidated Report")
     st.caption("Each operator is grouped under the division / sub-division they reported from most often "
                "in the selected period(s), independent of the Division filter above.")
-    ops = build_operators(ids)
     if ops.empty:
         st.info("No operator data found in the selected period. Make sure the daily upload file has a "
                 "Session Operator ID (or Operator ID) column.")
@@ -1143,9 +1279,9 @@ def report_tab():
             out3.to_excel(w, index=False, sheet_name="Operator Report")
             ws3 = w.sheets["Operator Report"]
             for i, c in enumerate(out3.columns, 1):
-                ws3.column_dimensions[chr(64 + i)].width = max(len(c), int(out3[c].astype(str).str.len().max())) + 3
+                ws3.column_dimensions[_excel_helpers()[1](i)].width = max(len(c), int(out3[c].astype(str).str.len().max())) + 3
             for cell in ws3[1] + ws3[ws3.max_row]:
-                cell.font = Font(bold=True)
+                cell.font = _excel_helpers()[0](bold=True)
         g1, g2 = st.columns(2)
         g1.download_button("Download Operator-wise Excel", buf3.getvalue(), "haryana_circle_operator_report.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1165,18 +1301,22 @@ def camp_entry_form():
     if is_admin():
         divisions = all_divisions
     else:
+        # Non-admins may only file camps for the division their login is linked
+        # to. Narrowing the list is convenience only; the save path re-checks.
         my_div = user_division()
         if not my_div:
             st.warning("Your login is not linked to any Division, so you cannot add camp entries. "
                        "Please contact the admin.")
             return
-        divisions = [d for d in all_divisions if norm(d) == norm(my_div)]
+        divisions = [d for d in all_divisions if parsers.norm(d) == parsers.norm(my_div)]
         if not divisions:
-            st.warning(f"Your Division ('{my_div}') was not found in the master sheet. Please contact the admin.")
+            st.warning(f"Your Division ('{my_div}') was not found in the master sheet. "
+                       "Please contact the admin.")
             return
 
     c1, c2, c3 = st.columns(3)
-    dv = c1.selectbox("Division", divisions, key="camp_dv", disabled=len(divisions) == 1 and not is_admin())
+    dv = c1.selectbox("Division", divisions, key="camp_dv",
+                      disabled=len(divisions) == 1 and not is_admin())
     subs = get_subdivisions(dv)
     sd = c2.selectbox("Sub Division", subs if subs else ["(none found in master)"], key="camp_sd")
     dt = c3.date_input("Camp date", value=datetime.now().date(), format="DD-MM-YYYY", key="camp_dt")
@@ -1185,8 +1325,10 @@ def camp_entry_form():
     txn = c5.number_input("Number of transactions", min_value=0, step=1, key="camp_txn")
     remarks = st.text_input("Remarks (optional)", key="camp_remarks")
     if st.button("Save camp entry"):
-        # server-side guard: a non-admin can only save for the Division linked to their own login
-        if not is_admin() and norm(dv) != norm(user_division() or ""):
+        # Server-side guard: the selectbox is not the authority. A non-admin may
+        # only save for the Division linked to their own login, whatever the
+        # widget state or a crafted request says.
+        if not is_admin() and parsers.norm(dv) != parsers.norm(user_division() or ""):
             st.error("You can only add camp entries for your own Division.")
         elif not loc.strip():
             st.warning("Please enter the camp location.")
@@ -1201,18 +1343,167 @@ def camp_entry_form():
 def excel_download(df, sheet_name, filename, label, bold_last_row=True):
     """Build a formatted .xlsx (auto column width, bold header + optional bold last row)
     and render a Streamlit download button for it."""
-    from openpyxl.styles import Font
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name=sheet_name)
         ws = w.sheets[sheet_name]
         for i, c in enumerate(df.columns, 1):
-            ws.column_dimensions[chr(64 + i)].width = max(len(c), int(df[c].astype(str).str.len().max())) + 3
+            ws.column_dimensions[_excel_helpers()[1](i)].width = max(len(c), int(df[c].astype(str).str.len().max())) + 3
         rows = ws[1] + ws[ws.max_row] if bold_last_row else ws[1]
         for cell in rows:
-            cell.font = Font(bold=True)
+            cell.font = _excel_helpers()[0](bold=True)
     st.download_button(label, buf.getvalue(), filename,
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _backup_status_cached():
+    return kv_sync.get_status()
+
+
+def _age_text(seconds):
+    if seconds is None:
+        return "unknown"
+    if seconds < 60:
+        return f"{seconds} second(s) ago"
+    if seconds < 3600:
+        return f"{seconds // 60} minute(s) ago"
+    if seconds < 86400:
+        return f"{seconds // 3600} hour(s) ago"
+    return f"{seconds // 86400} day(s) ago"
+
+
+def _since_text(iso_ts):
+    return f" since {iso_ts}" if iso_ts else ""
+
+
+def _rollback_controls(gens):
+    """Restore the live database from an earlier stored generation.
+
+    This overwrites the database the app is currently serving, so it is behind a
+    typed confirmation rather than a single click. The current file is kept as
+    `aadhaar.db.pre-rollback` before anything is replaced, so a rollback taken in
+    error is itself recoverable.
+    """
+    st.divider()
+    st.markdown("**Roll back to an earlier snapshot**")
+    st.caption("Replaces the database this instance is serving with an older stored "
+               "snapshot. Everything uploaded since that snapshot will be gone from "
+               "this instance. The current file is kept as `aadhaar.db.pre-rollback`, "
+               "and the upload that caused the problem is usually re-uploadable.")
+    older = [g for g in gens if not g.get("isLatest")]
+    if not older:
+        st.info("There is only one snapshot, so there is nothing to roll back to.")
+        return
+    options = {f"{g['generation']}  ({_age_text(g['ageSeconds'])})": g["generation"] for g in older}
+    choice = st.selectbox("Snapshot to restore", list(options), key="bk_rollback_pick")
+    typed = st.text_input("Type RESTORE to enable the button", key="bk_rollback_confirm")
+    if st.button("Restore this snapshot", key="bk_rollback_now",
+                 disabled=typed.strip().upper() != "RESTORE"):
+        gen = options[choice]
+        with st.spinner(f"Restoring {gen}..."):
+            result = kv_sync.restore_generation(gen)
+        if result.get("restored"):
+            audit("backup.rollback", f"generation {gen} ({result['bytes']:,} bytes)")
+            clear_report_cache()
+            st.success(f"Restored {result['bytes']:,} bytes from generation {gen}.")
+            st.rerun()
+        else:
+            st.error(f"Rollback failed: {result.get('reason')}")
+
+
+def backup_tab():
+    """Admin view of whether the off-site backup is actually working.
+
+    This exists because the old bridge failed silently: every restore and every
+    push returned 404, the only trace was one line in the boot log, and the app
+    looked perfectly healthy while holding no backups at all.
+    """
+    if not is_admin():  # server-side guard
+        st.error("Only the admin can view backup status.")
+        return
+
+    c1, c2 = st.columns([3, 1])
+    if c2.button("Refresh", key="bk_refresh", use_container_width=True):
+        _backup_status_cached.clear()
+
+    s = _backup_status_cached()
+    if not s["enabled"]:
+        st.info("The backup bridge is not configured on this host, so `aadhaar.db` is only "
+                "as durable as the disk it sits on. This is expected in local development. "
+                "On Render the database lives on an ephemeral filesystem and is destroyed on "
+                "every deploy, so AADHAR_SYNC_URL and AADHAR_SYNC_TOKEN must both be set.")
+        return
+
+    healthy = s["healthy"]
+    if healthy is True:
+        st.success("Backups are working.")
+    else:
+        st.error("Backups are NOT working. The database on this host is not backed up anywhere.")
+
+    if not s["reachable"]:
+        st.error(f"The bridge could not be reached: {s['bridge_error']}")
+
+    m = st.columns(4)
+    m[0].metric("Newest snapshot", _age_text(s["newest_snapshot_age_seconds"]))
+    m[1].metric("Last push from this instance", _age_text(s["last_backup_age_seconds"]))
+    m[2].metric("Snapshot size", f"{s['db_bytes'] / 1024 / 1024:.2f} MB" if s["db_bytes"] else "unknown")
+    m[3].metric("Consecutive failures", s["consecutive_failures"])
+
+    b = s.get("bridge") or {}
+    if b:
+        st.caption(f"Bridge: `{s['url']}` | snapshot age {_age_text(b.get('ageSeconds'))} | "
+                   f"pushes today {b.get('pushesToday')}/{b.get('dailyPushBudget')} "
+                   f"({b.get('pushesLeft')} left) | {b.get('trackedGenerations')} generation(s) kept, "
+                   f"oldest trimmed past {b.get('retain')}")
+    st.caption(f"Automatic push every {s['interval_minutes']} minute(s), and never sooner than "
+               f"{s['min_interval_minutes']} minute(s) after the last one. Writes that land inside that "
+               "window are pushed by the final push on shutdown.")
+
+    if s["last_error"]:
+        st.error(f"Last error: {s['last_error']}")
+    if s["skipped_budget"]:
+        st.warning("The bridge's daily push budget is exhausted, so pushes are paused until it resets. "
+                   "Restores still work. Raise DAILY_PUSH_BUDGET on the Worker, or lower "
+                   "AADHAR_SYNC_INTERVAL_MS so fewer pushes are needed.")
+    if s["skipped_size"]:
+        st.warning(f"The database is larger than AADHAR_SYNC_MAX_BYTES ({s['max_bytes']} bytes), so it is "
+                   "not being uploaded. Attach a persistent disk and stop using the bridge.")
+    if s["skipped_min_interval"]:
+        st.info("The most recent push was held back by the minimum interval, not lost. It goes out on the "
+                "next scheduled push or on shutdown.")
+    if s["pending_changes"]:
+        st.info(f"Changes are waiting to be pushed{_since_text(s['pending_since'])}.")
+    if s["restored"] and s["restored_from"]:
+        st.caption(f"This instance booted by restoring generation {s['restored_from']} from the bridge.")
+
+    a, b2 = st.columns(2)
+    if a.button("Back up now", type="primary", use_container_width=True, key="bk_backup_now"):
+        with st.spinner("Pushing a snapshot to the bridge..."):
+            result = kv_sync.backup_data(force=True, reason="admin")
+        _backup_status_cached.clear()
+        if result.get("backed_up"):
+            st.success(f"Pushed {result['bytes']:,} bytes as generation {result.get('generation')}.")
+        else:
+            st.error(f"Backup failed: {result.get('error') or result.get('reason')}")
+
+    with b2.expander("Kept snapshots", expanded=False):
+        gens = kv_sync.generations()
+        if gens and "error" in gens[0]:
+            st.error(gens[0]["error"])
+        elif gens:
+            st.dataframe(pd.DataFrame([{
+                "Generation": g["generation"],
+                "Pushed": g["at"],
+                "Age": _age_text(g["ageSeconds"]),
+                "Latest": "yes" if g["isLatest"] else "",
+            } for g in gens]), hide_index=True, use_container_width=True)
+            _rollback_controls(gens)
+        else:
+            st.info("The bridge holds no snapshots yet.")
+
+    st.caption("The same figures are available from a shell: `python kv_sync.py status` "
+               "(or `generations`).")
 
 
 def camps_tab():
@@ -1284,6 +1575,8 @@ def camps_tab():
             pick = st.selectbox("Select entry", list(opts), key="camp_del_pick")
             if st.button("Delete this entry"):
                 run("DELETE FROM camps WHERE id=?", (opts[pick],))
+                audit("camp.delete", opts[pick])
+                kv_sync.request_backup()
                 flash("Camp entry deleted.")
 
 
@@ -1295,9 +1588,26 @@ if "flash" in st.session_state:
 if not run("SELECT 1 FROM users WHERE role='admin'", one=True):
     setup_screen()
     st.stop()
+
+# Idle timeout. Streamlit reruns the whole script on every interaction, so this
+# is a reliable activity signal: an unattended browser stops touching widgets and
+# gets logged out. The point is that these are shared logins handed to divisions,
+# so a station left open stays usable by whoever walks up to it.
+_timed_out = False
+if "user" in st.session_state:
+    last_seen = st.session_state.get("last_seen")
+    if SESSION_TIMEOUT_MINUTES and last_seen and \
+            (datetime.now() - last_seen).total_seconds() > SESSION_TIMEOUT_MINUTES * 60:
+        st.session_state.clear()
+        _timed_out = True
+
 if "user" not in st.session_state:
+    if _timed_out:
+        st.info(f"You were signed out after {SESSION_TIMEOUT_MINUTES} minutes of inactivity. "
+                "Please log in again.")
     login_screen()
     st.stop()
+st.session_state["last_seen"] = datetime.now()
 if st.session_state["user"].get("must_change"):
     force_change_password_screen()
     st.stop()
@@ -1307,7 +1617,8 @@ PAGES = {"Dashboard": dashboard, "Operator Analysis": operator_analysis_tab, "Re
 if is_admin():
     PAGES["Upload data"] = upload_tab
     PAGES["Manage users"] = users_tab
+    PAGES["Backup status"] = backup_tab
 
 page = sidebar(list(PAGES))
 st.title(APP_NAME)
-PAGES[page]()
+PAGES[page]()

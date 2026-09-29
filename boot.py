@@ -19,7 +19,19 @@ PORT = os.environ.get("PORT", "8501")
 
 
 def main():
-    kv_sync.restore_data()
+    # The restore result is printed explicitly. It used to be discarded, so a
+    # boot that failed to restore looked exactly like a healthy one in the logs,
+    # and the app then pushed the empty database it had just created over the
+    # only good copy. A restore that does not succeed now says so on stdout.
+    result = kv_sync.restore_data()
+    if result.get("restored"):
+        print(f"[boot] restored aadhaar.db from the bridge "
+              f"({result.get('bytes')} bytes, generation {result.get('generation')})", flush=True)
+    elif kv_sync.enabled():
+        print(f"[boot] WARNING: aadhaar.db was NOT restored ({result.get('reason')}). "
+              f"The app will start on an empty database and kv_sync will refuse to "
+              f"push it, so the stored backup is safe. Do not enter real data until "
+              f"this is fixed.", flush=True)
     kv_sync.start_interval()
     cmd = [
         sys.executable,
@@ -30,9 +42,12 @@ def main():
         "--server.address=0.0.0.0",
         f"--server.port={PORT}",
         "--server.headless=true",
+        # Left off, matching .streamlit/config.toml. See the note there: enabling
+        # CORS with an origin allowlist was tried and broke the page while
+        # /health still returned 200, so this stays as it was.
         "--server.enableCORS=false",
         "--server.enableXsrfProtection=true",
-        "--server.maxUploadSize=50",
+        "--server.maxUploadSize=15",
         "--browser.gatherUsageStats=false",
     ]
     print(f"[boot] starting: {' '.join(cmd)}", flush=True)

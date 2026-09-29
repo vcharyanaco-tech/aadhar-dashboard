@@ -804,13 +804,33 @@ def operator_analysis_tab():
             "MBU", "Demographic Updates", "Non-MBU", "Updates", "Total"]
     show = show[cols].sort_values("Total", ascending=False)
 
-    top = show.head(20).copy()
-    top["Operator"] = top.apply(
-        lambda r: f"{r['Operator Name']} ({r['Operator ID']})" if r["Operator Name"] else r["Operator ID"], axis=1)
-    fig = _plotly().bar(top, x="Operator", y="Total", color="Division", text="Total",
-                title="Top 20 operators by total transactions")
-    fig.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
-    st.plotly_chart(fig, use_container_width=True)
+    # Top 2 and bottom 2 operators of every division. A division with 4 or fewer
+    # operators shows fewer bars: the top 2 are taken first, so nobody is drawn twice.
+    parts = []
+    for div_name, g in show.groupby("Division"):
+        g = g.sort_values("Total", ascending=False)
+        parts.append(g.head(2).assign(Rank="Top 2"))
+        parts.append(g.iloc[2:].tail(2).assign(Rank="Bottom 2"))
+    tb = pd.concat(parts, ignore_index=True) if parts else show.iloc[0:0].assign(Rank="")
+    if not tb.empty:
+        tb["Operator"] = tb.apply(
+            lambda r: f"{r['Operator Name']} ({r['Operator ID']})" if r["Operator Name"] else r["Operator ID"], axis=1)
+        n_div = tb["Division"].nunique()
+        wrap = min(n_div, 4)
+        fig = _plotly().bar(
+            tb, x="Operator", y="Total", color="Rank", text="Total", facet_col="Division",
+            facet_col_wrap=wrap, facet_col_spacing=0.04, facet_row_spacing=0.18,
+            color_discrete_map={"Top 2": "#2e7d32", "Bottom 2": "#c62828"},
+            category_orders={"Rank": ["Top 2", "Bottom 2"], "Operator": tb["Operator"].tolist(),
+                             "Division": sorted(tb["Division"].unique())},
+            title="Top 2 and bottom 2 operators of each division (by total transactions)",
+            height=340 * ((n_div + wrap - 1) // wrap) + 80)
+        fig.update_traces(texttemplate="%{text:,.0f}", textposition="outside", cliponaxis=False)
+        fig.update_xaxes(matches=None, showticklabels=True, tickangle=-40, title_text="")
+        fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1]))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Green = 2 highest, red = 2 lowest operators in that division for the selected period(s). "
+                   "Divisions with 4 or fewer operators show fewer bars.")
 
     st.subheader("Operator-wise details")
     st.dataframe(show, hide_index=True, use_container_width=True)
@@ -1186,7 +1206,7 @@ def report_tab():
 
     # One call gives both the station and operator aggregates from a single
     # read of master and tx.
-    agg_full, missing, _, ops = build_period(ids)
+    agg_full, missing, _, _ = build_period(ids)
     not_in_master = agg_full[agg_full["division"] == "Not in master"]
     st.caption(f"Stations in daily data: {len(agg_full)} | not found in master: "
                f"{len(not_in_master)} | master stations with no data: {len(missing)}")
@@ -1315,42 +1335,6 @@ def report_tab():
                              hide_index=True, use_container_width=True)
         st.download_button("Download Not Working Stations CSV", nw.to_csv(index=False).encode("utf-8-sig"),
                            "haryana_circle_not_working_stations.csv", "text/csv", key="dl_not_working")
-
-    st.divider()
-    st.subheader("Operator-wise Consolidated Report")
-    st.caption("Each operator is grouped under the division / sub-division they reported from most often "
-               "in the selected period(s), independent of the Division filter above.")
-    if ops.empty:
-        st.info("No operator data found in the selected period. Make sure the daily upload file has a "
-                "Session Operator ID (or Operator ID) column.")
-    else:
-        orep = ops[["operator", "operator_name", "division", "sub_division", "total", "enr", "mbu", "demo",
-                    "nonmbu", "days_worked"]].sort_values(["division", "sub_division", "total"],
-                                                ascending=[True, True, False]).copy()
-        orep.columns = ["Operator ID", "Operator Name", "Division", "Sub Division", "Total Transactions", "New Enrollments",
-                        "MBU", "Demographic Updates", "Non-MBU Biometric Updates", "Days Worked"]
-        num_cols = ["Total Transactions", "New Enrollments", "MBU", "Demographic Updates",
-                   "Non-MBU Biometric Updates", "Days Worked"]
-        orep[num_cols] = orep[num_cols].round().astype(int)
-        grand3 = pd.DataFrame([["Grand Total", "", "", ""] + [int(orep[c].sum()) for c in num_cols]],
-                              columns=orep.columns)
-        out3 = pd.concat([orep, grand3], ignore_index=True)
-        st.dataframe(out3, hide_index=True, use_container_width=True)
-
-        buf3 = BytesIO()
-        with pd.ExcelWriter(buf3, engine="openpyxl") as w:
-            out3.to_excel(w, index=False, sheet_name="Operator Report")
-            ws3 = w.sheets["Operator Report"]
-            for i, c in enumerate(out3.columns, 1):
-                ws3.column_dimensions[_excel_helpers()[1](i)].width = max(len(c), int(out3[c].astype(str).str.len().max())) + 3
-            for cell in ws3[1] + ws3[ws3.max_row]:
-                cell.font = _excel_helpers()[0](bold=True)
-        g1, g2 = st.columns(2)
-        g1.download_button("Download Operator-wise Excel", buf3.getvalue(), "haryana_circle_operator_report.xlsx",
-                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           key="op_rep_dl_xlsx")
-        g2.download_button("Download Operator-wise CSV", out3.to_csv(index=False).encode("utf-8-sig"),
-                           "haryana_circle_operator_report.csv", "text/csv", key="op_rep_dl_csv")
 
 
 def camp_entry_form():

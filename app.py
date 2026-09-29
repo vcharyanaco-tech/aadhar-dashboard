@@ -70,7 +70,7 @@ def init_db():
         location TEXT, transactions INTEGER, remarks TEXT, created_by TEXT, created_at TEXT)""")
     con = sqlite3.connect(DB)
     try:
-        ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0"})
+        ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0", "division": "TEXT"})
         con.commit()
     finally:
         con.close()
@@ -96,10 +96,10 @@ def check_new_credentials(username, pw1, pw2, need_username=True):
     return None
 
 
-def add_user(username, password, role="user", must_change=0):
+def add_user(username, password, role="user", must_change=0, division=None):
     salt, h = hash_pw(password)
-    run("INSERT INTO users(username, salt, pw_hash, role, created_at, must_change) VALUES (?,?,?,?,?,?)",
-        (username, salt, h, role, datetime.now().strftime("%Y-%m-%d %H:%M"), must_change))
+    run("INSERT INTO users(username, salt, pw_hash, role, created_at, must_change, division) VALUES (?,?,?,?,?,?,?)",
+        (username, salt, h, role, datetime.now().strftime("%Y-%m-%d %H:%M"), must_change, division))
 
 
 def set_password(username, password, must_change=0):
@@ -126,9 +126,12 @@ def bulk_create_division_users(default_password="Dop.1234"):
     for division in divs["division"]:
         uname = slugify_username(division)
         if uname in existing:
+            # older logins created before division-linking: attach the division if still empty
+            run("UPDATE users SET division=? WHERE username=? AND role='user' AND (division IS NULL OR division='')",
+                (division, uname))
             skipped.append((division, uname))
             continue
-        add_user(uname, default_password, "user", must_change=1)
+        add_user(uname, default_password, "user", must_change=1, division=division)
         existing.add(uname)
         created.append((division, uname))
     return created, renamed, skipped
@@ -156,6 +159,14 @@ def authenticate(username, password):
 
 def is_admin():
     return st.session_state.get("user", {}).get("role") == "admin"
+
+
+def user_division():
+    """Division linked to the logged-in user (read fresh from the DB). None for admin / unlinked users."""
+    me = st.session_state.get("user", {})
+    row = run("SELECT division FROM users WHERE username=?", (me.get("username", ""),), one=True)
+    d = (row["division"] or "").strip() if row else ""
+    return d or None
 
 
 def flash(msg):
@@ -870,18 +881,21 @@ def users_tab():
     with st.form("new_user", clear_on_submit=True):
         u = st.text_input("Username").strip().lower()
         p = st.text_input("Temporary password", type="password")
+        dv_new = st.selectbox("Division (for camp entry rights)", ["(none)"] + get_divisions())
         if st.form_submit_button("Create user"):
             err = check_new_credentials(u, p, p)
             if err:
                 st.error(err)
             else:
-                add_user(u, p, "user", must_change=1)
+                add_user(u, p, "user", must_change=1, division=None if dv_new == "(none)" else dv_new)
                 flash(f"User '{u}' created. Share the username and password with them - "
                      "they will need to set a new password on first login.")
 
-    users = read_sql("SELECT username, role, active, created_at FROM users ORDER BY role, username")
-    st.dataframe(users.assign(active=users["active"].map({1: "Yes", 0: "No"})).rename(columns={
-        "username": "Username", "role": "Role", "active": "Active", "created_at": "Created"}),
+    users = read_sql("SELECT username, role, division, active, created_at FROM users ORDER BY role, username")
+    st.dataframe(users.assign(active=users["active"].map({1: "Yes", 0: "No"}),
+                              division=users["division"].fillna("")).rename(columns={
+        "username": "Username", "role": "Role", "division": "Division", "active": "Active",
+        "created_at": "Created"}),
         hide_index=True, use_container_width=True)
 
     others = [x for x in users["username"] if x != me]
@@ -907,6 +921,17 @@ def users_tab():
             st.success(f"Password reset to {DEFAULT_TEMP_PASSWORD} for {target}. "
                       "They will need to set a new password on first login.")
     row = users[users["username"] == target].iloc[0]
+    divs = get_divisions()
+    cur_div = row["division"] if isinstance(row["division"], str) else ""
+    opts_div = ["(none)"] + divs
+    d1, d2 = st.columns([2, 1])
+    new_div = d1.selectbox("Division of selected user (camp entry rights)", opts_div,
+                           index=opts_div.index(cur_div) if cur_div in opts_div else 0, key="assign_div")
+    d2.write("")
+    d2.write("")
+    if d2.button("Save division"):
+        run("UPDATE users SET division=? WHERE username=?", (None if new_div == "(none)" else new_div, target))
+        flash(f"Division updated for {target}.")
     a, b = st.columns(2)
     if a.button("Disable login" if row["active"] else "Enable login"):
         run("UPDATE users SET active=? WHERE username=?", (0 if row["active"] else 1, target))
@@ -1131,13 +1156,27 @@ def report_tab():
 
 def camp_entry_form():
     st.subheader("Add camp entry")
-    divisions = get_divisions()
-    if not divisions:
+    all_divisions = get_divisions()
+    if not all_divisions:
         st.info("The master sheet has not been uploaded yet. The admin must upload the master sheet "
                 "before camp entries can be added.")
         return
+
+    if is_admin():
+        divisions = all_divisions
+    else:
+        my_div = user_division()
+        if not my_div:
+            st.warning("Your login is not linked to any Division, so you cannot add camp entries. "
+                       "Please contact the admin.")
+            return
+        divisions = [d for d in all_divisions if norm(d) == norm(my_div)]
+        if not divisions:
+            st.warning(f"Your Division ('{my_div}') was not found in the master sheet. Please contact the admin.")
+            return
+
     c1, c2, c3 = st.columns(3)
-    dv = c1.selectbox("Division", divisions, key="camp_dv")
+    dv = c1.selectbox("Division", divisions, key="camp_dv", disabled=len(divisions) == 1 and not is_admin())
     subs = get_subdivisions(dv)
     sd = c2.selectbox("Sub Division", subs if subs else ["(none found in master)"], key="camp_sd")
     dt = c3.date_input("Camp date", value=datetime.now().date(), format="DD-MM-YYYY", key="camp_dt")
@@ -1146,10 +1185,13 @@ def camp_entry_form():
     txn = c5.number_input("Number of transactions", min_value=0, step=1, key="camp_txn")
     remarks = st.text_input("Remarks (optional)", key="camp_remarks")
     if st.button("Save camp entry"):
-        if not loc.strip():
+        # server-side guard: a non-admin can only save for the Division linked to their own login
+        if not is_admin() and norm(dv) != norm(user_division() or ""):
+            st.error("You can only add camp entries for your own Division.")
+        elif not loc.strip():
             st.warning("Please enter the camp location.")
-        elif not subs:
-            st.warning("No Sub Division was found in the master sheet for this division.")
+        elif not subs or sd not in subs:
+            st.warning("No valid Sub Division was found in the master sheet for this division.")
         else:
             save_camp(dt.strftime("%d-%m-%Y"), dv, sd, loc.strip(), int(txn), remarks.strip(),
                       st.session_state["user"]["username"])
@@ -1268,4 +1310,4 @@ if is_admin():
 
 page = sidebar(list(PAGES))
 st.title(APP_NAME)
-PAGES[page]()
+PAGES[page]()

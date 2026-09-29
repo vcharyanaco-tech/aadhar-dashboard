@@ -25,7 +25,6 @@ from openpyxl.utils import get_column_letter
 import kv_sync
 import parsers
 from parsers import (
-    daily_target_for,
     date_from_filename,
     describe_excluded,
     norm_key,
@@ -35,6 +34,7 @@ from parsers import (
     parse_operator_master,
     parse_tx,
     split_working_days,
+    target_table,
 )
 
 DATA_DIR = Path(os.environ.get("APP_DATA_DIR", "data"))
@@ -119,15 +119,68 @@ def init_db():
     run("""CREATE TABLE IF NOT EXISTS camps(
         id INTEGER PRIMARY KEY AUTOINCREMENT, camp_date TEXT, division TEXT, sub_division TEXT,
         location TEXT, transactions INTEGER, remarks TEXT, created_by TEXT, created_at TEXT)""")
+    run("""CREATE TABLE IF NOT EXISTS division_targets(
+        division TEXT PRIMARY KEY, daily_target INTEGER NOT NULL,
+        updated_by TEXT, updated_at TEXT)""")
+    run("""CREATE TABLE IF NOT EXISTS audit(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, username TEXT, action TEXT, detail TEXT)""")
     con = connect()
     try:
         parsers.ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0"})
         # The report queries filter on tx.upload_id and join on tx.key; without
         # these every page load is a full scan of a table that grows daily.
         parsers.ensure_indexes(con)
+        parsers.ensure_audit_index_on(con)
         con.commit()
     finally:
         con.close()
+    seed_division_targets()
+
+
+def seed_division_targets():
+    """Copy the built-in targets into the table the first time it is empty.
+
+    Deliberately only on an empty table. Once an admin edits a target it is
+    theirs, and a later change to the constants in parsers.py must not silently
+    overwrite it - that would make a target look like it had been changed by
+    someone who did not change it.
+    """
+    if run("SELECT 1 FROM division_targets LIMIT 1", one=True):
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for division, target in parsers.DIVISION_DAILY_TARGETS.items():
+        run("INSERT OR IGNORE INTO division_targets(division, daily_target, updated_by, updated_at)"
+            " VALUES (?,?,?,?)", (division, target, "built-in", now))
+
+
+def daily_targets():
+    """Division -> daily target, from the database with the built-ins as a fallback.
+
+    Falls back to the constants so a division present in the master sheet but
+    absent from the table still gets measured rather than silently dropped from
+    the target comparison.
+    """
+    table = {}
+    for r in run("SELECT division, daily_target FROM division_targets", many=True):
+        table[r["division"]] = r["daily_target"]
+    merged = dict(parsers.DIVISION_DAILY_TARGETS)
+    merged.update(table)
+    return merged
+
+
+def target_lookup():
+    """Name-insensitive division -> daily target, for the target table."""
+    return {parsers.norm(k): v for k, v in daily_targets().items()}
+
+
+def audit(action, detail=""):
+    """Record an action in the audit log. Best-effort: never block the action."""
+    try:
+        user = st.session_state.get("user", {}).get("username", "system")
+        run("INSERT INTO audit(at, username, action, detail) VALUES (?,?,?,?)",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user, action, str(detail)[:500]))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- auth
@@ -154,6 +207,7 @@ def add_user(username, password, role="user", must_change=0):
     salt, h = hash_pw(password)
     run("INSERT INTO users(username, salt, pw_hash, role, created_at, must_change) VALUES (?,?,?,?,?,?)",
         (username, salt, h, role, datetime.now().strftime("%Y-%m-%d %H:%M"), must_change))
+    audit("user.create", f"{username} as {role}")
     kv_sync.request_backup()
 
 
@@ -161,6 +215,8 @@ def set_password(username, password, must_change=0):
     salt, h = hash_pw(password)
     run("UPDATE users SET salt=?, pw_hash=?, fails=0, locked_until=NULL, must_change=? WHERE username=?",
         (salt, h, must_change, username))
+    # Never the password itself: the audit log is backed up off-site.
+    audit("user.password_change", username)
     kv_sync.request_backup()
 
 
@@ -204,6 +260,9 @@ def bulk_create_division_users(default_password=None):
         add_user(uname, password, "user", must_change=1)
         existing.add(uname)
         created.append((division, uname))
+    if created:
+        audit("user.bulk_create", f"{len(created)} division login(s): "
+                                  + ", ".join(u for _, u in created))
     return created, skipped, password
 
 
@@ -314,6 +373,9 @@ def replace_master(m, confirm_orphans=False):
     finally:
         con.close()
     clear_report_cache()
+    audit("master.replace", f"{summary['incoming']} stations in, "
+                            f"{summary['orphaned']} previously-seen key(s) orphaned"
+                            + (", OVERRIDDEN" if confirm_orphans else ""))
     kv_sync.request_backup()
     return summary
 
@@ -339,6 +401,7 @@ def save_operator_master(m):
     finally:
         con.close()
     clear_report_cache()
+    audit("operator_master.replace", f"{n} operators")
     kv_sync.request_backup()
     return n
 
@@ -361,6 +424,7 @@ def save_tx(t, label, by):
     finally:
         con.close()
     clear_report_cache()
+    audit("tx.upload", f"{label}: {len(t)} rows")
     kv_sync.request_backup()
     return upload_id
 
@@ -386,6 +450,7 @@ def save_camp(camp_date, division, sub_division, location, transactions, remarks
         VALUES (?,?,?,?,?,?,?,?)""",
         (camp_date, division, sub_division, location, transactions, remarks, by,
          datetime.now().strftime("%Y-%m-%d %H:%M")))
+    audit("camp.create", f"{camp_date} {division}/{sub_division} {location} ({transactions})")
     kv_sync.request_backup()
 
 
@@ -549,11 +614,9 @@ def dashboard():
     label_by_id = {r["id"]: r["label"] for r in uploads}
     period_days, excluded, unknown_dates = split_working_days(
         [parse_label_date(label_by_id.get(i)) for i in ids])
-    tgt = show.groupby("Division")["Total"].sum().reset_index().rename(columns={"Total": "Achievement"})
-    tgt["Daily Target"] = tgt["Division"].map(daily_target_for)
-    no_target = sorted(tgt.loc[tgt["Daily Target"].isna(), "Division"])
-    tgt = tgt.dropna(subset=["Daily Target"])
-    if len(tgt):
+    achievement = show.groupby("Division")["Total"].sum().reset_index()
+    tgt, no_target = target_table(achievement, period_days, target_lookup())
+    if len(tgt) and period_days > 0:
         if period_days <= 0:
             # Every selected day is a non-working day. A target of zero would
             # make the percentage meaningless, so say so rather than divide.
@@ -564,11 +627,6 @@ def dashboard():
                 "shown in the station details below. "
                 + describe_excluded(excluded))
         else:
-            tgt["Target"] = (tgt["Daily Target"] * period_days).astype(int)
-            tgt["Achievement"] = tgt["Achievement"].astype(int)
-            tgt["Shortfall / Surplus"] = tgt["Achievement"] - tgt["Target"]
-            tgt["% Achieved"] = (tgt["Achievement"] / tgt["Target"] * 100).round(1)
-
             st.subheader("Target vs Achievement")
             st.caption(
                 f"Target = Daily Target x {period_days} working day(s) selected above "
@@ -797,8 +855,11 @@ def upload_tab():
         pick_id = st.selectbox("Delete an upload", [r["id"] for r in ups],
                                format_func=lambda i: next(r["label"] for r in ups if r["id"] == i))
         if st.button("Delete selected upload"):
+            label = next((r["label"] for r in ups if r["id"] == pick_id), str(pick_id))
+            n_rows = run("SELECT COUNT(*) n FROM tx WHERE upload_id=?", (pick_id,), one=True)["n"]
             run("DELETE FROM tx WHERE upload_id=?", (pick_id,))
             run("DELETE FROM uploads WHERE id=?", (pick_id,))
+            audit("tx.delete", f"upload '{label}' (#{pick_id}) and {n_rows} transaction row(s)")
             clear_report_cache()
             kv_sync.request_backup()
             flash("Upload deleted.")
@@ -835,6 +896,64 @@ def users_tab():
                          hide_index=True, use_container_width=True)
         if not created and not skipped:
             st.info("No Division found in the master sheet.")
+
+    st.divider()
+    st.subheader("Daily targets")
+    st.caption("Competent Authority approved daily transaction target per division. "
+               "These decide the Target column on the dashboard. Editing one takes "
+               "effect immediately; it is recorded in the activity log below.")
+    known = daily_targets()
+    if table_exists("master"):
+        for d in get_divisions():
+            known.setdefault(d, parsers.DIVISION_DAILY_TARGETS.get(d))
+    with st.form("targets_form"):
+        st.caption(f"Configured: {len(parsers.DIVISION_DAILY_TARGETS)} built-in. "
+                   "Leave blank for a division with no approved target.")
+        cols = st.columns(4)
+        new_targets = {}
+        for i, division in enumerate(sorted(known)):
+            with cols[i % 4]:
+                current = known.get(division)
+                new_targets[division] = st.number_input(
+                    division, min_value=0, value=int(current) if current else 0,
+                    step=10, key=f"tgt_{division}", format="%d")
+        if st.form_submit_button("Save targets"):
+            changed = []
+            for division, value in new_targets.items():
+                value = int(value)
+                before = known.get(division)
+                if before != value:
+                    run("INSERT INTO division_targets(division, daily_target, updated_by, updated_at)"
+                        " VALUES (?,?,?,?) ON CONFLICT(division) DO UPDATE SET"
+                        " daily_target=excluded.daily_target, updated_by=excluded.updated_by,"
+                        " updated_at=excluded.updated_at",
+                        (division, value, st.session_state["user"]["username"],
+                         datetime.now().strftime("%Y-%m-%d %H:%M")))
+                    changed.append(f"{division}: {before if before is not None else 'none'} -> {value}")
+            if changed:
+                audit("targets.update", "; ".join(changed))
+                kv_sync.request_backup()
+                flash(f"Saved {len(changed)} target change(s).")
+            else:
+                st.info("No changes.")
+
+    st.divider()
+    st.subheader("Activity log")
+    st.caption("Every upload, deletion, user change and rollback, with who did it. "
+               "Kept permanently and backed up with the rest of the database.")
+    limit = st.number_input("Show latest", min_value=20, max_value=1000, value=100, step=20,
+                            key="audit_limit")
+    logs = read_sql("SELECT at, username, action, detail FROM audit ORDER BY id DESC LIMIT ?",
+                    (int(limit),))
+    if logs.empty:
+        st.info("Nothing recorded yet. Actions taken from now on will appear here.")
+    else:
+        show_log = logs.rename(columns={"at": "When", "username": "Who",
+                                        "action": "Action", "detail": "Detail"})
+        st.dataframe(show_log, hide_index=True, use_container_width=True)
+        st.download_button("Download activity log CSV",
+                           show_log.to_csv(index=False).encode("utf-8-sig"),
+                           "aadhar_activity_log.csv", "text/csv", key="audit_dl")
 
     st.divider()
     st.subheader("Create user login")
@@ -884,12 +1003,14 @@ def users_tab():
     a, b = st.columns(2)
     if a.button("Disable login" if row["active"] else "Enable login"):
         run("UPDATE users SET active=? WHERE username=?", (0 if row["active"] else 1, target))
+        audit("user.disable" if row["active"] else "user.enable", target)
         kv_sync.request_backup()
         flash("User updated.")
     with b:
         sure = st.checkbox("Confirm delete")
         if st.button("Delete user") and sure:
             run("DELETE FROM users WHERE username=?", (target,))
+            audit("user.delete", target)
             kv_sync.request_backup()
             flash(f"User '{target}' deleted.")
 
@@ -907,100 +1028,19 @@ OPERATOR_EMPTY_COLS = ["operator", "operator_name", "division", "sub_division", 
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
 def build_period(ids):
-    """Everything the report pages need for a set of uploads, from one read of each table.
+    """Cached wrapper around parsers.aggregate_period.
 
-    Returns (station_totals, master_without_data, master, operator_totals).
-
-    Station and operator figures are two different aggregations of the same rows,
-    so they are computed together from a single pass. Previously build_operators
-    called build_stations *and* re-read tx, which made one Report render issue
-    three heavy queries (1 master + 2 tx) instead of two.
-
-    Cached because it runs on every rerun of every report page. `ids` is passed
-    as a tuple so the cache key is hashable; call `clear_report_cache()` after any
-    write that changes master or transaction data.
+    The aggregation itself lives in parsers.py so it can be tested without a
+    Streamlit runtime. This only adds the cache, which is keyed on the selected
+    upload ids; `clear_report_cache()` runs on the writes that change master or
+    transaction data, and the TTL is a backstop rather than the mechanism.
     """
-    ids = tuple(ids)
-    m = read_sql(f"SELECT {', '.join(_MASTER_COLS)} FROM master")
-    for c in ("sub_division", "address", "district"):
-        if c not in m.columns:
-            m[c] = ""
-
-    placeholders = ",".join("?" * len(ids))
-    t = read_sql(f"SELECT {', '.join(_STATION_TX_COLS)}, operator FROM tx "
-                 f"WHERE upload_id IN ({placeholders})", ids)
-    for c in ("mbu", "demo", "nonmbu", "enr", "upd"):
-        t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0) if c in t.columns else 0.0
-    for c in ("t_div", "t_sub", "address", "district"):
-        t[c] = t[c].fillna("").astype(str) if c in t.columns else ""
-
-    if t.empty:
-        empty_stations = pd.DataFrame(columns=["key", "station", "district", "address", "t_div", "t_sub",
-                                               "machines", "days_reported", "enr", "mbu", "demo",
-                                               "nonmbu", "upd", "total", "office_id", "division",
-                                               "sub_division", "m_addr", "m_dist"])
-        return empty_stations, m, m, pd.DataFrame(columns=OPERATOR_EMPTY_COLS)
-
-    # ---- station totals
-    agg = t.groupby("key", as_index=False).agg(
-        station=("station", "first"), district=("district", "first"), address=("address", "first"),
-        t_div=("t_div", "first"), t_sub=("t_sub", "first"), machines=("key", "size"),
-        days_reported=("upload_id", "nunique"),
-        enr=("enr", "sum"), mbu=("mbu", "sum"), demo=("demo", "sum"), nonmbu=("nonmbu", "sum"),
-        upd=("upd", "sum"))
-    agg["total"] = agg["enr"] + agg["upd"]
-    mm = m[["key", "office_id", "division", "sub_division"]].assign(m_addr=m["address"], m_dist=m["district"])
-    agg = agg.merge(mm, on="key", how="left")
-
-    def first_filled(a, b, default):
-        a, b = a.fillna("").astype(str).str.strip(), b.fillna("").astype(str).str.strip()
-        return a.where(a != "", b.where(b != "", default))
-
-    agg["division"] = first_filled(agg["division"], agg["t_div"], "Not in master")
-    agg["sub_division"] = first_filled(agg["sub_division"], agg["t_sub"], "Not mapped")
-    agg["office_id"] = agg["office_id"].fillna("")
-    agg["address"] = first_filled(agg["address"], agg["m_addr"], "")
-    agg["district"] = first_filled(agg["district"], agg["m_dist"], "")
-    missing = m[~m["key"].isin(agg["key"])]
-
-    # ---- operator totals, from the same rows
-    ops = _aggregate_operators(t, agg)
-    return agg, missing, m, ops
-
-
-def _aggregate_operators(t, station_agg):
-    """Operator-wise totals, mapped to the division their stations belong to.
-
-    Each operator is attributed to the division / sub-division they reported
-    from most often in the period. Split out of build_period so it can be
-    tested on its own; it takes the already-read rows and never touches SQL.
-    """
-    empty = pd.DataFrame(columns=OPERATOR_EMPTY_COLS)
-    if "operator" not in t.columns or t.empty:
-        return empty
-    key_div = station_agg.set_index("key")[["division", "sub_division"]]
-    t = t[t["operator"].fillna("").astype(str).str.strip() != ""].copy()
-    if t.empty:
-        return empty
-    t["operator"] = t["operator"].fillna("").astype(str).str.strip()
-    t = t.join(key_div, on="key")
-    t["division"] = t["division"].fillna("Not in master")
-    t["sub_division"] = t["sub_division"].fillna("Not mapped")
-
-    def mode(s):
-        return s.value_counts().idxmax()
-
-    op = t.groupby("operator", as_index=False).agg(
-        division=("division", mode), sub_division=("sub_division", mode),
-        stations=("key", "nunique"), days_worked=("upload_id", "nunique"),
-        enr=("enr", "sum"), mbu=("mbu", "sum"), demo=("demo", "sum"), nonmbu=("nonmbu", "sum"), upd=("upd", "sum"))
-    op["total"] = op["enr"] + op["upd"]
-    op["operator_name"] = op["operator"].map(norm_key).map(operator_names()).fillna("")
-    return op
+    con = connect()
+    try:
+        return parsers.aggregate_period(con, tuple(ids))
+    finally:
+        con.close()
 
 
 REPORT_COLS = ["Division Name", "Sub Division Name", "Total Transactions", "New Enrollments", "MBU",
@@ -1239,6 +1279,7 @@ def _rollback_controls(gens):
         with st.spinner(f"Restoring {gen}..."):
             result = kv_sync.restore_generation(gen)
         if result.get("restored"):
+            audit("backup.rollback", f"generation {gen} ({result['bytes']:,} bytes)")
             clear_report_cache()
             st.success(f"Restored {result['bytes']:,} bytes from generation {gen}.")
             st.rerun()
@@ -1409,6 +1450,7 @@ def camps_tab():
             pick = st.selectbox("Select entry", list(opts), key="camp_del_pick")
             if st.button("Delete this entry"):
                 run("DELETE FROM camps WHERE id=?", (opts[pick],))
+                audit("camp.delete", opts[pick])
                 kv_sync.request_backup()
                 flash("Camp entry deleted.")
 

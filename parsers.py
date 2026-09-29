@@ -405,6 +405,160 @@ def parse_operator_master(df):
     return m[OPERATOR_COLS]
 
 
+# ---------------------------------------------------------------- aggregation
+# Columns the report builders read. Selecting them explicitly rather than `*`
+# keeps a schema change from silently widening every report query, and lets the
+# index on (key, upload_id) do the work.
+STATION_TX_COLS = ["key", "station", "district", "address", "t_div", "t_sub", "upload_id",
+                   "enr", "mbu", "demo", "nonmbu", "upd"]
+MASTER_COLS = ["key", "station", "office_id", "division", "sub_division", "address", "district"]
+OPERATOR_COLS_OUT = ["operator", "operator_name", "division", "sub_division", "stations",
+                     "days_worked", "enr", "mbu", "demo", "nonmbu", "upd", "total"]
+STATION_COLS_OUT = ["key", "station", "district", "address", "t_div", "t_sub", "machines",
+                    "days_reported", "enr", "mbu", "demo", "nonmbu", "upd", "total",
+                    "office_id", "division", "sub_division", "m_addr", "m_dist"]
+
+
+def aggregate_period(con, ids):
+    """Everything the report pages need for a set of uploads.
+
+    Returns (station_totals, master_without_data, master, operator_totals).
+
+    Station and operator figures are two aggregations of the same rows, so they
+    are computed from a single pass. This used to be split across two functions
+    that each read `tx`, which made one Report render issue three heavy queries
+    instead of two.
+
+    Lives here rather than in app.py so the reported figures can be tested
+    without a Streamlit runtime. It takes a connection and touches no UI.
+    """
+    ids = tuple(ids)
+    m = pd.read_sql_query(
+        f"SELECT {', '.join(quote_ident(c) for c in MASTER_COLS)} FROM {quote_ident('master')}", con)
+    for c in ("sub_division", "address", "district"):
+        if c not in m.columns:
+            m[c] = ""
+
+    if ids:
+        placeholders = ",".join("?" * len(ids))
+        cols = ", ".join(quote_ident(c) for c in STATION_TX_COLS + ["operator"])
+        t = pd.read_sql_query(
+            f"SELECT {cols} FROM {quote_ident('tx')} "
+            f"WHERE {quote_ident('upload_id')} IN ({placeholders})", con, params=ids)
+    else:
+        t = pd.DataFrame(columns=STATION_TX_COLS + ["operator"])
+
+    for c in ("mbu", "demo", "nonmbu", "enr", "upd"):
+        t[c] = pd.to_numeric(t[c], errors="coerce").fillna(0) if c in t.columns else 0.0
+    for c in ("t_div", "t_sub", "address", "district"):
+        t[c] = t[c].fillna("").astype(str) if c in t.columns else ""
+
+    if t.empty:
+        return (pd.DataFrame(columns=STATION_COLS_OUT), m, m,
+                pd.DataFrame(columns=OPERATOR_COLS_OUT))
+
+    agg = t.groupby("key", as_index=False).agg(
+        station=("station", "first"), district=("district", "first"), address=("address", "first"),
+        t_div=("t_div", "first"), t_sub=("t_sub", "first"), machines=("key", "size"),
+        days_reported=("upload_id", "nunique"),
+        enr=("enr", "sum"), mbu=("mbu", "sum"), demo=("demo", "sum"),
+        nonmbu=("nonmbu", "sum"), upd=("upd", "sum"))
+    agg["total"] = agg["enr"] + agg["upd"]
+    mm = m[["key", "office_id", "division", "sub_division"]].assign(
+        m_addr=m["address"], m_dist=m["district"])
+    agg = agg.merge(mm, on="key", how="left")
+
+    def first_filled(a, b, default):
+        a, b = a.fillna("").astype(str).str.strip(), b.fillna("").astype(str).str.strip()
+        return a.where(a != "", b.where(b != "", default))
+
+    # A station's division comes from the master, falling back to whatever the
+    # daily file claimed, and only then to "Not in master".
+    agg["division"] = first_filled(agg["division"], agg["t_div"], "Not in master")
+    agg["sub_division"] = first_filled(agg["sub_division"], agg["t_sub"], "Not mapped")
+    agg["office_id"] = agg["office_id"].fillna("")
+    agg["address"] = first_filled(agg["address"], agg["m_addr"], "")
+    agg["district"] = first_filled(agg["district"], agg["m_dist"], "")
+    missing = m[~m["key"].isin(agg["key"])]
+
+    return agg, missing, m, aggregate_operators(t, agg, operator_names(con))
+
+
+def aggregate_operators(t, station_agg, names=None):
+    """Operator-wise totals, each mapped to the division it reported from most often.
+
+    `t` must be the already-read transaction rows and `station_agg` the station
+    aggregate from the same rows, so this never re-queries.
+    """
+    empty = pd.DataFrame(columns=OPERATOR_COLS_OUT)
+    if "operator" not in t.columns or t.empty:
+        return empty
+    key_div = station_agg.set_index("key")[["division", "sub_division"]]
+    t = t[t["operator"].fillna("").astype(str).str.strip() != ""].copy()
+    if t.empty:
+        return empty
+    t["operator"] = t["operator"].fillna("").astype(str).str.strip()
+    t = t.join(key_div, on="key")
+    t["division"] = t["division"].fillna("Not in master")
+    t["sub_division"] = t["sub_division"].fillna("Not mapped")
+
+    def mode(s):
+        return s.value_counts().idxmax()
+
+    op = t.groupby("operator", as_index=False).agg(
+        division=("division", mode), sub_division=("sub_division", mode),
+        stations=("key", "nunique"), days_worked=("upload_id", "nunique"),
+        enr=("enr", "sum"), mbu=("mbu", "sum"), demo=("demo", "sum"),
+        nonmbu=("nonmbu", "sum"), upd=("upd", "sum"))
+    op["total"] = op["enr"] + op["upd"]
+    lookup = names if names is not None else pd.Series(dtype=str)
+    op["operator_name"] = op["operator"].map(norm_key).map(lookup).fillna("")
+    return op
+
+
+def target_table(achievement_by_division, working_days, lookup):
+    """Target vs achievement per division.
+
+    `working_days` is the count of *working* days selected, not the number of
+    uploads: a Sunday is closed, so counting it as a day of opportunity sets a
+    target no division can meet. `lookup` maps a division name to its daily
+    target or None when unconfigured.
+
+    Returns a DataFrame with divisions lacking a target removed, plus the list of
+    those division names so the caller can say which were dropped.
+    """
+    frame = pd.DataFrame(achievement_by_division).rename(columns={"Total": "Achievement"})
+    # Match ignoring case and spacing, the same way the built-in lookup does. A
+    # master sheet spells divisions "Hisar" while the lookup is keyed "hisar",
+    # so mapping the raw name would silently match nothing.
+    lookup = {norm(k): v for k, v in lookup.items()}
+    frame["Daily Target"] = frame["Division"].map(lambda d: lookup.get(norm(d)))
+    no_target = sorted(frame.loc[frame["Daily Target"].isna(), "Division"])
+    frame = frame.dropna(subset=["Daily Target"])
+    if frame.empty or working_days <= 0:
+        # No working days (or no divisions): return the shape with no figures
+        # rather than NaN rows, so the caller can tell "nothing to show" from
+        # "achievement was zero".
+        empty = frame.reindex(columns=["Division", "Achievement", "Daily Target",
+                                       "Target", "Shortfall / Surplus", "% Achieved"])
+        return empty, no_target
+    frame["Target"] = (frame["Daily Target"] * working_days).astype(int)
+    frame["Achievement"] = frame["Achievement"].astype(int)
+    frame["Shortfall / Surplus"] = frame["Achievement"] - frame["Target"]
+    frame["% Achieved"] = (frame["Achievement"] / frame["Target"] * 100).round(1)
+    return frame, no_target
+
+
+def ensure_audit_index_on(con):
+    """The audit log is only ever read newest-first; keep that cheap as it grows."""
+    t = quote_ident("audit")
+    have = {r[1] for r in con.execute(f"PRAGMA table_info({t})")}
+    if not have:
+        return []
+    con.execute(f"CREATE INDEX IF NOT EXISTS {quote_ident('idx_audit_at')} ON {t} ({quote_ident('at')})")
+    return ["idx_audit_at"]
+
+
 # ---------------------------------------------------------------- persistence
 # Identifiers that reach SQL as text. `quote_ident` accepts a value only if it
 # matches, so nothing caller-supplied can ever be interpolated into a statement.

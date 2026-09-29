@@ -342,6 +342,39 @@ silently lowering it would flatter achievement — and the count is shown.
 
 Change the pattern with `AADHAR_NON_WORKING_WEEKDAYS` (no redeploy needed).
 
+## Activity log and targets
+
+Every action that changes data is recorded in an `audit` table with the username
+and a timestamp: uploads, upload deletions, master and operator-master
+replacement, user creation, password changes, enable/disable/delete, camp
+entries, camp deletion, target edits, and snapshot rollbacks. The admin **Manage
+users** tab shows the latest entries and can export them to CSV.
+
+The point is that the destructive actions are the ones you need to attribute
+later. Deleting an upload removes its transaction rows; replacing the master can
+orphan history; a rollback replaces the live database. None of those is
+recoverable from the log itself, but "who did it and when" is the first question
+asked afterwards. Passwords are never written to it.
+
+**Daily targets are editable in the same tab.** They start from the built-in
+values in `parsers.py` and are then owned by the database — the constants are
+seeded only into an empty table, so a later change to the code cannot silently
+overwrite a target an admin has set. Each change is logged.
+
+## Two backup paths
+
+| | |
+| --- | --- |
+| **Live** | `aadhar-backup` Worker, `aadhar-dashboard-backups` KV. What the service writes to and restores from. |
+| **Legacy, stale** | `dashboardharyana.site/api/backup/aadhaar-db` in the dash-site Worker. Still holds the September 2026 snapshot. Nothing writes to or reads from it. |
+
+The legacy route is a foot-gun rather than a backup: it looks valid, it is
+authenticated, and it returns a database that is months out of date. Retiring it
+means removing the `/aadhaar-db` branch from `dash-site/src/worker/worker.js` and
+deleting `BACKUP_AADHAR_KEY` from that project's KV namespace — which has to be
+deployed from the Cloudflare account that owns `dashboardharyana.site`, not this
+one. Until then, `tools/check_backup_health.py` says so on every run.
+
 ## Security notes
 
 - Passwords are stored as PBKDF2-SHA256 hashes with a per-user salt, 200,000
@@ -366,10 +399,11 @@ Change the pattern with `AADHAR_NON_WORKING_WEEKDAYS` (no redeploy needed).
 | `kv_sync.py` | The off-site backup bridge client |
 | `backup-worker/` | The Cloudflare Worker that stores the snapshots |
 | `keepalive-worker/` | The Cloudflare cron that pings Render to stop the instance idling |
-| `tests/test_parsers.py` | 77 tests covering the parsing and persistence rules |
-| `tests/test_screens.py` | 24 tests driving the real script through Streamlit's AppTest |
-| `tools/smoketest_backup_tab.py` | Interactive check of the admin login path and backup tab |
+| `tests/test_parsers.py` | Parsing and persistence rules |
+| `tests/test_aggregation.py` | The aggregation behind every reported figure |
+| `tests/test_screens.py` | Drives the real script through Streamlit's AppTest |
 | `tools/check_backup_health.py` | One-command check that the database is actually mirrored |
+| `tools/report_data_health.py` | Data-health report for a real snapshot |
 
 ## Tests
 

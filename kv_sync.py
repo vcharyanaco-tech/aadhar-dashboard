@@ -515,6 +515,15 @@ def start_interval():
     _install_lifecycle()
 
     def _loop():
+        # Push once immediately, then on the interval. The loop used to sleep
+        # first, which meant a freshly booted instance - including one that had
+        # just restored a snapshot - left the bridge unconfirmed for a full hour.
+        # If the restore produced something the bridge did not already hold, this
+        # is what publishes it.
+        try:
+            _flush()
+        except Exception as err:
+            _log(f"startup backup error: {err}")
         while not _shutdown:
             time.sleep(INTERVAL_MS / 1000.0)
             if _shutdown:

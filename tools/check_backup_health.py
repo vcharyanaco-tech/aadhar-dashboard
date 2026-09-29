@@ -81,6 +81,9 @@ def main(argv):
         print("UNHEALTHY  nothing is backed up. The database exists only on Render's")
         print("          ephemeral disk and will be lost on the next deploy or restart.")
         print("          Log in and upload data - every write triggers a push.")
+        print()
+        print("Legacy path: dashboardharyana.site/api/backup/aadhaar-db still exists in the")
+        print("dash-site Worker. It is stale, not live, and is not where backups go now.")
         return 1
 
     if age is not None and age > 2 * 3600:
@@ -90,6 +93,12 @@ def main(argv):
 
     print()
     print("HEALTHY  the database is mirrored off Render's ephemeral disk.")
+    print()
+    print("Legacy path: dashboardharyana.site/api/backup/aadhaar-db still exists in the")
+    print("dash-site Worker and still holds the September snapshot. Nothing writes to or")
+    print("reads from it now - the service is pointed at this bridge - so it is a stale")
+    print("copy, not a live backup. Retiring it needs a change in the dash-site repo")
+    print("(deployed by that project's own account).")
     return 0
 
 

@@ -8,21 +8,17 @@ address = "0.0.0.0"
 fileWatcherType = "none"
 enableXsrfProtection = true
 
-# CORS: enabled and restricted to the two hostnames this app is served on.
-# boot.py passes the same values as flags, and a flag wins, so they are stated in
-# both places deliberately. The previous `false` made Streamlit reply with
-# `Access-Control-Allow-Origin: *` and accept a WebSocket from any origin, and
-# it warned about that on every boot.
-enableCORS = true
-corsAllowedOrigins = [
-  "https://dashboardharyana.site",
-  "https://www.dashboardharyana.site",
-]
-allowedHosts = [
-  "dashboardharyana.site",
-  "www.dashboardharyana.site",
-  "aadhar-dashboard-5i4x.onrender.com",
-]
+# CORS left off, as it was before. Turning it on with an explicit
+# corsAllowedOrigins allowlist was tried and took the app down: Streamlit's
+# host-config then advertised only its own default origins, a browser at
+# dashboardharyana.site had its WebSocket rejected, and the page rendered as a
+# blank shell with the service still answering /health 200.
+#
+# With CORS off, Streamlit sends no Access-Control-Allow-Origin header, so a
+# cross-origin browser request is blocked by the browser itself. The startup
+# warning Streamlit prints about this is a generic notice about a posture that
+# is a deliberate choice for a directly-exposed app, not a misconfiguration.
+enableCORS = false
 
 # Upload cap in MB. Kept in step with --server.maxUploadSize in boot.py: Streamlit
 # gives the command-line flag precedence, so the two must agree or the effective

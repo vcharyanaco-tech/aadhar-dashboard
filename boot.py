@@ -42,16 +42,10 @@ def main():
         "--server.address=0.0.0.0",
         f"--server.port={PORT}",
         "--server.headless=true",
-        # CORS on, restricted to the two public hostnames. The old
-        # --server.enableCORS=false made Streamlit reply with
-        # `Access-Control-Allow-Origin: *` and accept a WebSocket from any
-        # origin, and it printed a warning about exactly that on every boot.
-        # Allowing the origins we actually serve is both safer and quieter.
-        "--server.enableCORS=true",
-        "--server.corsAllowedOrigins=https://dashboardharyana.site,https://www.dashboardharyana.site",
-        # allowedHosts stops a DNS-rebinding attempt from pointing a browser at
-        # this origin by name. The hostnames Streamlit will accept.
-        "--server.allowedHosts=dashboardharyana.site,www.dashboardharyana.site,aadhar-dashboard-5i4x.onrender.com",
+        # Left off, matching .streamlit/config.toml. See the note there: enabling
+        # CORS with an origin allowlist was tried and broke the page while
+        # /health still returned 200, so this stays as it was.
+        "--server.enableCORS=false",
         "--server.enableXsrfProtection=true",
         "--server.maxUploadSize=15",
         "--browser.gatherUsageStats=false",

@@ -1147,6 +1147,32 @@ def build_period(ids):
 REPORT_COLS = ["Division Name", "Sub Division Name", "Total Transactions", "New Enrollments", "MBU",
                "Demographic Updates", "Non-MBU Biometric Updates"]
 
+STATION_COLS = ["Total Station IDs", "Working Stations", "Not Working Stations"]
+
+
+def station_status_counts(agg, missing, by):
+    """Station-ID counts per group (`by` is a list of column names).
+
+    Total Station IDs = stations that reported in the period + master stations
+    with no data at all. Working = stations with at least one transaction in the
+    period. Not Working = everything else (zero-transaction stations and master
+    stations that never appeared in the uploaded files).
+    """
+    a = agg.assign(_w=(agg["total"] > 0).astype(int))
+    a = a.groupby(by).agg(_seen=("key", "size"), _work=("_w", "sum"))
+    m = missing.copy()
+    if "sub_division" in by:
+        m["sub_division"] = m["sub_division"].fillna("Not mapped").replace("", "Not mapped")
+    if m.empty:
+        c = a.assign(_miss=0)
+    else:
+        c = a.join(m.groupby(by).size().rename("_miss"), how="outer")
+    c = c.fillna(0).astype(int).reset_index()
+    c["Total Station IDs"] = c["_seen"] + c["_miss"]
+    c["Working Stations"] = c["_work"]
+    c["Not Working Stations"] = c["Total Station IDs"] - c["Working Stations"]
+    return c[by + STATION_COLS]
+
 
 def report_tab():
     uploads = run("SELECT * FROM uploads ORDER BY id DESC", many=True)
@@ -1198,11 +1224,17 @@ def report_tab():
     dv = st.selectbox("Division", ["All"] + sorted(agg_full["division"].unique()), key="rep_div")
     agg = agg_full if dv == "All" else agg_full[agg_full["division"] == dv]
 
-    rep = (agg.groupby(["division", "sub_division"], as_index=False)[["total", "enr", "mbu", "demo", "nonmbu"]].sum()
-           .sort_values(["division", "sub_division"]))
-    rep.columns = REPORT_COLS
-    rep[REPORT_COLS[2:]] = rep[REPORT_COLS[2:]].round().astype(int)
-    grand = pd.DataFrame([["Grand Total", ""] + [int(rep[c].sum()) for c in REPORT_COLS[2:]]], columns=REPORT_COLS)
+    miss_sel = missing if dv == "All" else missing[missing["division"] == dv]
+    by2 = ["division", "sub_division"]
+    tx_cols = ["total", "enr", "mbu", "demo", "nonmbu"]
+    rep = (station_status_counts(agg, miss_sel, by2)
+           .merge(agg.groupby(by2, as_index=False)[tx_cols].sum(), on=by2, how="left")
+           .fillna(0).sort_values(by2))
+    rep_cols = REPORT_COLS[:2] + STATION_COLS + REPORT_COLS[2:]
+    rep.columns = rep_cols
+    num_cols_rep = rep_cols[2:]
+    rep[num_cols_rep] = rep[num_cols_rep].round().astype(int)
+    grand = pd.DataFrame([["Grand Total", ""] + [int(rep[c].sum()) for c in num_cols_rep]], columns=rep_cols)
     out = pd.concat([rep, grand], ignore_index=True)
 
     if (agg["sub_division"] == "Not mapped").any():
@@ -1210,6 +1242,9 @@ def report_tab():
                    "and upload the master again.")
     st.caption("Total Transactions (Count_U_plus_N_plus_Z) = New Enrollments + MBU + Demographic Updates + "
                "Non-MBU Biometric Updates. When several days are selected, their figures are added together.")
+    st.caption("Working Stations = station IDs with at least one transaction in the selected period(s). "
+               "Not Working Stations = station IDs with no transactions (including master stations that "
+               "never appeared in the uploaded data). Total Station IDs = Working + Not Working.")
     st.dataframe(out, hide_index=True, use_container_width=True)
 
     buf = BytesIO()
@@ -1228,11 +1263,14 @@ def report_tab():
 
     st.divider()
     st.subheader("Division-wise Consolidated Report")
-    st.caption("All divisions, summed to a single row each - independent of the Division filter above.")
-    cons = (agg_full.groupby("division", as_index=False)[["total", "enr", "mbu", "demo", "nonmbu"]].sum()
-            .sort_values("division"))
-    cons.columns = ["Division Name", "Total Transactions", "New Enrollments", "MBU",
-                     "Demographic Updates", "Non-MBU Biometric Updates"]
+    st.caption("All divisions, summed to a single row each - independent of the Division filter above. "
+               "Station counts show how many station IDs each division has, how many are working "
+               "(at least one transaction in the selected period) and how many are not.")
+    cons = (station_status_counts(agg_full, missing, ["division"])
+            .merge(agg_full.groupby("division", as_index=False)[tx_cols].sum(), on="division", how="left")
+            .fillna(0).sort_values("division"))
+    cons.columns = ["Division Name"] + STATION_COLS + ["Total Transactions", "New Enrollments", "MBU",
+                                                       "Demographic Updates", "Non-MBU Biometric Updates"]
     cons[cons.columns[1:]] = cons[cons.columns[1:]].round().astype(int)
     grand2 = pd.DataFrame([["Grand Total"] + [int(cons[c].sum()) for c in cons.columns[1:]]], columns=cons.columns)
     out2 = pd.concat([cons, grand2], ignore_index=True)
@@ -1251,6 +1289,32 @@ def report_tab():
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     c2.download_button("Download Division-wise CSV", out2.to_csv(index=False).encode("utf-8-sig"),
                        "haryana_circle_division_consolidated.csv", "text/csv")
+
+    st.divider()
+    st.subheader("Not Working Stations - Division-wise List")
+    st.caption("Station IDs with no transactions in the selected period(s). 'No data in period' means the "
+               "station is in the master sheet but never appeared in the uploaded files; 'No transactions in "
+               "period' means it appeared but with zero transactions. Independent of the Division filter above.")
+    nw_cols = ["division", "sub_division", "station", "office_id"]
+    nw = pd.concat([
+        agg_full[agg_full["total"] <= 0][nw_cols].assign(Status="No transactions in period"),
+        missing[nw_cols].assign(Status="No data in period"),
+    ], ignore_index=True)
+    nw["sub_division"] = nw["sub_division"].fillna("Not mapped").replace("", "Not mapped")
+    nw = nw.rename(columns={"division": "Division", "sub_division": "Sub Division",
+                            "station": "Station", "office_id": "Office ID"})
+    nw = nw.sort_values(["Division", "Sub Division", "Station"])
+    if nw.empty:
+        st.success("All station IDs have reported transactions in the selected period.")
+    else:
+        totals = station_status_counts(agg_full, missing, ["division"]).set_index("division")["Total Station IDs"]
+        for div_name, g in nw.groupby("Division"):
+            total_ids = int(totals.get(div_name, len(g)))
+            with st.expander(f"{div_name} - {len(g)} not working out of {total_ids} station IDs"):
+                st.dataframe(g[["Sub Division", "Station", "Office ID", "Status"]],
+                             hide_index=True, use_container_width=True)
+        st.download_button("Download Not Working Stations CSV", nw.to_csv(index=False).encode("utf-8-sig"),
+                           "haryana_circle_not_working_stations.csv", "text/csv", key="dl_not_working")
 
     st.divider()
     st.subheader("Operator-wise Consolidated Report")

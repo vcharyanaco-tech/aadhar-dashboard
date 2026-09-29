@@ -671,13 +671,12 @@ def dashboard():
         v = v[blob.str.contains(q, regex=False)]
     miss = missing if dv == "All" else missing[missing["division"] == dv]
 
-    k = st.columns(6)
+    k = st.columns(5)
     k[0].metric("Total transactions", f"{int(v['total'].sum()):,}")
     k[1].metric("New enrolments", f"{int(v['enr'].sum()):,}")
     k[2].metric("Updates", f"{int(v['upd'].sum()):,}")
-    k[3].metric("Stations reporting", f"{int(v['days_reported'].sum()):,}")
-    k[4].metric("Zero-transaction stations", f"{int((v['total'] == 0).sum()):,}")
-    k[5].metric("Master stations with no data", f"{len(miss):,}")
+    k[3].metric("Zero-transaction stations", f"{int((v['total'] == 0).sum()):,}")
+    k[4].metric("Master stations with no data", f"{len(miss):,}")
 
     show = v.rename(columns={"station": "Station", "office_id": "Office ID", "division": "Division",
                              "sub_division": "Sub Division", "district": "District",

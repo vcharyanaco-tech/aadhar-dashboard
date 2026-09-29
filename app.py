@@ -17,12 +17,41 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
-from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
 
 import kv_sync
+
+# plotly and openpyxl are imported on first use, not at module scope.
+#
+# The login page pays for every module-level import on a cold start, and Render's
+# free tier runs on a throttled shared CPU where that cost is several times
+# higher than on a workstation. Measured locally: streamlit 811 ms, pandas
+# 485 ms, openpyxl 166 ms, plotly 87 ms. plotly is only needed for the dashboard
+# charts and openpyxl only for the Excel exports, so neither is required to draw
+# a login form, and paying for both on every cold start was roughly a fifth of
+# the page's load time. pandas stays at module scope: parsers needs it, and
+# read_sql_query is on the main path.
+
+
+def _plotly():
+    global _px
+    if _px is None:
+        import plotly.express as px
+        _px = px
+    return _px
+
+
+def _excel_helpers():
+    global _excel
+    if _excel is None:
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+        _excel = (Font, get_column_letter)
+    return _excel
+
+
+_px = None
+_excel = None
 import parsers
 from parsers import (
     date_from_filename,
@@ -53,8 +82,14 @@ DEFAULT_TEMP_PASSWORD = os.environ.get("AADHAR_DEFAULT_TEMP_PASSWORD") or ""
 # mid-report, short enough that an unattended station is not still signed in.
 SESSION_TIMEOUT_MINUTES = int(float(os.environ.get("SESSION_TIMEOUT_MINUTES") or 30))
 APP_NAME = "HARYANA CIRCLE AADHAR MONITORING DASHBOARD"
-# Put the India Post logo in the same folder as app.py and name it logo.png (or logo.jpg)
-LOGO = next((p for n in ("logo.png", "logo.jpg", "logo.jpeg", "logo.webp")
+# Put the India Post logo in the same folder as app.py, named logo.webp (or
+# .png/.jpg). WebP is preferred and logo.webp is the one shipped: logo.png is
+# 600x389 and the largest thing this app ever sends, but it is only ever
+# displayed at about 170px, so it was roughly 3x oversized. At 400px wide the
+# same image is 28 KB instead of 88 KB, and since the login page inlines it the
+# saving lands on every single render. logo.png is kept unmodified as the source
+# the webp was generated from.
+LOGO = next((p for n in ("logo.webp", "logo.png", "logo.jpg", "logo.jpeg")
              if (p := Path(__file__).parent / n).exists()), None)
 
 
@@ -663,7 +698,7 @@ def dashboard():
                 + ((" " + describe_excluded(excluded)) if excluded else "")
                 + (f" {unknown_dates} upload label(s) could not be read as a date and "
                    "were counted as working days." if unknown_dates else ""))
-            fig_t = px.bar(tgt.melt("Division", value_vars=["Target", "Achievement"],
+            fig_t = _plotly().bar(tgt.melt("Division", value_vars=["Target", "Achievement"],
                                     var_name="Type", value_name="Count"),
                            x="Division", y="Count", color="Type", barmode="group", text="Count",
                            color_discrete_map={"Target": "#B0B0B0", "Achievement": "#7A1F2B"},
@@ -684,7 +719,7 @@ def dashboard():
 
     st.divider()
     d = show.groupby("Division")[["New enrolment", "Updates"]].sum().reset_index()
-    fig_d = px.bar(d.melt("Division", var_name="Type", value_name="Count"), x="Division", y="Count",
+    fig_d = _plotly().bar(d.melt("Division", var_name="Type", value_name="Count"), x="Division", y="Count",
                    color="Type", barmode="stack", text="Count", title="Division-wise transactions")
     fig_d.update_traces(texttemplate="%{text:,.0f}", textposition="inside")
     st.plotly_chart(fig_d, use_container_width=True)
@@ -753,7 +788,7 @@ def operator_analysis_tab():
     top = show.head(20).copy()
     top["Operator"] = top.apply(
         lambda r: f"{r['Operator Name']} ({r['Operator ID']})" if r["Operator Name"] else r["Operator ID"], axis=1)
-    fig = px.bar(top, x="Operator", y="Total", color="Division", text="Total",
+    fig = _plotly().bar(top, x="Operator", y="Total", color="Division", text="Total",
                 title="Top 20 operators by total transactions")
     fig.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
     st.plotly_chart(fig, use_container_width=True)
@@ -1143,9 +1178,9 @@ def report_tab():
         out.to_excel(w, index=False, sheet_name="Report")
         ws = w.sheets["Report"]
         for i, c in enumerate(out.columns, 1):
-            ws.column_dimensions[get_column_letter(i)].width = max(len(c), int(out[c].astype(str).str.len().max())) + 3
+            ws.column_dimensions[_excel_helpers()[1](i)].width = max(len(c), int(out[c].astype(str).str.len().max())) + 3
         for cell in ws[1] + ws[ws.max_row]:
-            cell.font = Font(bold=True)
+            cell.font = _excel_helpers()[0](bold=True)
     a, b = st.columns(2)
     a.download_button("Download Excel", buf.getvalue(), "haryana_circle_report.xlsx",
                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1169,9 +1204,9 @@ def report_tab():
         out2.to_excel(w, index=False, sheet_name="Division Consolidated")
         ws2 = w.sheets["Division Consolidated"]
         for i, c in enumerate(out2.columns, 1):
-            ws2.column_dimensions[get_column_letter(i)].width = max(len(c), int(out2[c].astype(str).str.len().max())) + 3
+            ws2.column_dimensions[_excel_helpers()[1](i)].width = max(len(c), int(out2[c].astype(str).str.len().max())) + 3
         for cell in ws2[1] + ws2[ws2.max_row]:
-            cell.font = Font(bold=True)
+            cell.font = _excel_helpers()[0](bold=True)
     c1, c2 = st.columns(2)
     c1.download_button("Download Division-wise Excel", buf2.getvalue(), "haryana_circle_division_consolidated.xlsx",
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -1204,9 +1239,9 @@ def report_tab():
             out3.to_excel(w, index=False, sheet_name="Operator Report")
             ws3 = w.sheets["Operator Report"]
             for i, c in enumerate(out3.columns, 1):
-                ws3.column_dimensions[get_column_letter(i)].width = max(len(c), int(out3[c].astype(str).str.len().max())) + 3
+                ws3.column_dimensions[_excel_helpers()[1](i)].width = max(len(c), int(out3[c].astype(str).str.len().max())) + 3
             for cell in ws3[1] + ws3[ws3.max_row]:
-                cell.font = Font(bold=True)
+                cell.font = _excel_helpers()[0](bold=True)
         g1, g2 = st.columns(2)
         g1.download_button("Download Operator-wise Excel", buf3.getvalue(), "haryana_circle_operator_report.xlsx",
                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1250,10 +1285,10 @@ def excel_download(df, sheet_name, filename, label, bold_last_row=True):
         df.to_excel(w, index=False, sheet_name=sheet_name)
         ws = w.sheets[sheet_name]
         for i, c in enumerate(df.columns, 1):
-            ws.column_dimensions[get_column_letter(i)].width = max(len(c), int(df[c].astype(str).str.len().max())) + 3
+            ws.column_dimensions[_excel_helpers()[1](i)].width = max(len(c), int(df[c].astype(str).str.len().max())) + 3
         rows = ws[1] + ws[ws.max_row] if bold_last_row else ws[1]
         for cell in rows:
-            cell.font = Font(bold=True)
+            cell.font = _excel_helpers()[0](bold=True)
     st.download_button(label, buf.getvalue(), filename,
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 

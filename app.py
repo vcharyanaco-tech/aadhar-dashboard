@@ -13,7 +13,7 @@ import re
 import secrets
 import sqlite3
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -181,6 +181,14 @@ def init_db():
         updated_by TEXT, updated_at TEXT)""")
     run("""CREATE TABLE IF NOT EXISTS audit(
         id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, username TEXT, action TEXT, detail TEXT)""")
+    # One row per machine whose station ID changed. The old ID stays in `master`
+    # (so history keeps its division); this table says from which date it stops
+    # counting and the new ID starts. Full copies of both master rows are kept so a
+    # later master upload can put them back.
+    run("""CREATE TABLE IF NOT EXISTS station_changes(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, old_key TEXT, old_station TEXT,
+        new_key TEXT, new_station TEXT, office_id TEXT, division TEXT, sub_division TEXT,
+        address TEXT, district TEXT, effective_date TEXT, changed_by TEXT, changed_at TEXT)""")
     con = connect()
     try:
         parsers.ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0", "division": "TEXT"})
@@ -311,7 +319,7 @@ def bulk_create_division_users(default_password=None):
     Returns (created, skipped) where each entry is (division, username).
     """
     if not table_exists("master"):
-        return [], []
+        return [], [], ""
     password = default_password or DEFAULT_TEMP_PASSWORD or generate_temp_password()
     divs = read_sql("SELECT DISTINCT division FROM master WHERE division!='' ORDER BY division")
     existing = {r["username"] for r in run("SELECT username FROM users", many=True)}
@@ -376,6 +384,26 @@ def user_division():
 def flash(msg):
     st.session_state["flash"] = msg
     st.rerun()
+
+
+def _password_dialog_body(username, password, note):
+    st.write(note)
+    if username:
+        st.write(f"Login: **{username}**")
+    st.code(password, language=None)
+    st.caption("Shown only now. It is not stored in readable form and will not appear again. "
+               "The user must set a new password on first login.")
+    if st.button("Close", key="pw_dialog_close"):
+        st.rerun()
+
+
+def show_password_popup(title, username, password, note):
+    """Show a password once, in a pop-up. Falls back to an inline box on old Streamlit."""
+    dialog = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
+    if dialog is None:
+        st.warning(f"{title}: {note} Login: {username or '-'}  Password: {password}")
+        return
+    dialog(title)(_password_dialog_body)(username, password, note)
 
 
 # ---------------------------------------------------------------- file parsing
@@ -449,6 +477,9 @@ def replace_master(m, confirm_orphans=False):
 
     Returns a summary dict. Set `confirm_orphans` to proceed despite the warning.
     """
+    m, carried = carry_over_station_changes(m)
+    if carried:
+        audit("master.carry_over", f"{carried} station ID(s) from Station ID changes re-added to the new master")
     con = connect()
     try:
         summary = parsers.save_master(con, m, on_replace=None if confirm_orphans else _refuse_orphan_replace)
@@ -510,6 +541,207 @@ def save_tx(t, label, by):
     audit("tx.upload", f"{label}: {len(t)} rows")
     kv_sync.request_backup()
     return upload_id
+
+
+# ---------------------------------------------------------------- station ID changes
+def apply_station_changes(agg, missing, period_dates, changes):
+    """Adjust the period aggregates for machines whose station ID changed.
+
+    An old ID stays in master forever, so its history keeps its division. What
+    changes is whether it is *counted*: from the effective date onward the old ID
+    is no longer a station, and before the effective date the new ID is not yet
+    one. A retired/not-yet-live ID is dropped from "no data" and "zero
+    transactions" only; if it did record transactions in the period it still
+    counts as working. A period that straddles the effective date counts both IDs.
+    Periods containing an upload whose label is not a date are left unadjusted.
+    """
+    if changes is None or len(changes) == 0:
+        return agg, missing
+    agg = agg.copy()
+    missing = missing.copy()
+
+    # Backstop: an old ID missing from master still maps to its old division.
+    info = changes.drop_duplicates("old_key", keep="last").set_index("old_key")
+    stray = (agg["division"] == "Not in master") & agg["key"].isin(info.index)
+    if stray.any():
+        for col in ("division", "sub_division", "office_id"):
+            if col in agg.columns:
+                agg.loc[stray, col] = agg.loc[stray, "key"].map(info[col])
+
+    if not period_dates or any(d is None for d in period_dates):
+        return agg, missing
+    start, end = min(period_dates), max(period_dates)
+    eff = pd.to_datetime(changes["effective_date"], errors="coerce").dt.date
+    old_gone = set(changes.loc[eff.notna() & (eff <= start), "old_key"])
+    new_pending = set(changes.loc[eff.notna() & (eff > end), "new_key"])
+    inactive = old_gone | new_pending
+    if inactive:
+        missing = missing[~missing["key"].isin(inactive)]
+        agg = agg[~(agg["key"].isin(inactive) & (agg["total"] <= 0))]
+    return agg.reset_index(drop=True), missing.reset_index(drop=True)
+
+
+def build_period_adj(ids):
+    """build_period plus the station-ID-change adjustments (never cached, cheap)."""
+    agg, missing, m, ops = build_period(ids)
+    try:
+        changes = read_sql("SELECT * FROM station_changes")
+        if changes.empty:
+            return agg, missing, m, ops
+        marks = ",".join("?" * len(ids))
+        labels = run(f"SELECT label FROM uploads WHERE id IN ({marks})", tuple(ids), many=True)
+        dates = [parse_label_date(r["label"]) for r in labels]
+        agg, missing = apply_station_changes(agg, missing, dates, changes)
+    except Exception as e:
+        st.warning(f"Station ID changes could not be applied to this report: {e}")
+    return agg, missing, m, ops
+
+
+def carry_over_station_changes(m):
+    """Put retired and replacement stations back into a freshly uploaded master.
+
+    A master sheet normally lists only current IDs. Without this, uploading it
+    would drop the old IDs (their history would show "Not in master") and the new
+    IDs entered through the Station ID change form. Returns (master, rows_added).
+    """
+    try:
+        ch = read_sql("SELECT * FROM station_changes ORDER BY id")
+        need = {"key", "station", "office_id", "division", "sub_division"}
+        if ch.empty or not need.issubset(m.columns):
+            return m, 0
+        have = set(m["key"].astype(str))
+        rows = []
+        for _, r in ch.iterrows():
+            for k, name in ((r["old_key"], r["old_station"]), (r["new_key"], r["new_station"])):
+                if str(k) in have:
+                    continue
+                have.add(str(k))
+                rows.append({"key": k, "station": name, "office_id": r["office_id"],
+                             "division": r["division"], "sub_division": r["sub_division"],
+                             "address": r["address"], "district": r["district"]})
+        if not rows:
+            return m, 0
+        extra = pd.DataFrame(rows).reindex(columns=m.columns)
+        for c in extra.columns:
+            if extra[c].dtype == object:
+                extra[c] = extra[c].fillna("")
+        return pd.concat([m, extra], ignore_index=True), len(rows)
+    except Exception:
+        return m, 0
+
+
+def register_station_change(old_key, new_id, effective, by):
+    """Retire `old_key` from `effective` and add `new_id` to master. Returns (ok, message)."""
+    new_id = str(new_id).strip()
+    if not new_id:
+        return False, "Enter the new station ID."
+    con = connect()
+    try:
+        old = con.execute("SELECT * FROM master WHERE key=?", (old_key,)).fetchone()
+        if old is None:
+            return False, "The selected station is no longer in the master."
+        old = dict(old)
+        try:
+            new_key = norm_key(new_id)
+            rule_ok = norm_key(old["station"]) == old["key"]
+        except Exception:
+            return False, "Could not work out the key for this station ID."
+        if not rule_ok:
+            return False, ("The master's keys are not built from the station ID alone, so a new key "
+                           "cannot be derived safely. Send parsers.py so this can be adapted.")
+        if not new_key or new_key == old_key:
+            return False, "The new station ID must be different from the old one."
+        if con.execute("SELECT 1 FROM master WHERE key=?", (new_key,)).fetchone():
+            return False, "This station ID already exists in the master."
+        row = dict(old)
+        row["key"], row["station"] = new_key, new_id
+        cols = list(row)
+        con.execute("INSERT INTO master(" + ",".join(f'"{c}"' for c in cols) + ") VALUES ("
+                    + ",".join("?" * len(cols)) + ")", [row[c] for c in cols])
+        con.execute(
+            "INSERT INTO station_changes(old_key, old_station, new_key, new_station, office_id, division,"
+            " sub_division, address, district, effective_date, changed_by, changed_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (old_key, old.get("station"), new_key, new_id, old.get("office_id"), old.get("division"),
+             old.get("sub_division"), old.get("address"), old.get("district"),
+             effective.strftime("%Y-%m-%d"), by, datetime.now().strftime("%Y-%m-%d %H:%M")))
+        con.commit()
+    finally:
+        con.close()
+    clear_report_cache()
+    audit("station.change", f"{old.get('station')} -> {new_id} ({old.get('division')}/"
+                            f"{old.get('sub_division')}) effective {effective.strftime('%d-%m-%Y')}")
+    kv_sync.request_backup()
+    return True, (f"Station ID changed: {old.get('station')} -> {new_id}, effective "
+                  f"{effective.strftime('%d-%m-%Y')}.")
+
+
+def undo_station_change(change_id):
+    """Reverse a change made by mistake. Refused once the new ID has transaction data."""
+    row = run("SELECT * FROM station_changes WHERE id=?", (change_id,), one=True)
+    if row is None:
+        return False, "That change no longer exists."
+    try:
+        used = run("SELECT 1 FROM tx WHERE key=? LIMIT 1", (row["new_key"],), one=True)
+    except Exception:
+        return False, "Could not check whether the new ID already has data, so nothing was changed."
+    if used:
+        return False, ("The new station ID already has transaction data, so this change cannot be "
+                       "undone. Add another Station ID change instead.")
+    run("DELETE FROM master WHERE key=?", (row["new_key"],))
+    run("DELETE FROM station_changes WHERE id=?", (change_id,))
+    clear_report_cache()
+    audit("station.change_undo", f"{row['old_station']} -> {row['new_station']}")
+    kv_sync.request_backup()
+    return True, "Station ID change undone."
+
+
+def station_change_section():
+    st.subheader("Station ID change")
+    st.caption("Use this when a machine's station ID has changed. The old ID stays in the master so old "
+               "reports keep working, but it is not counted from the effective date onward. The new ID is "
+               "added to the master with the same office, division and sub division and is counted from "
+               "the effective date. Every change is recorded in the activity log.")
+    if not table_exists("master"):
+        st.info("Upload the master sheet first.")
+        return
+    master = read_sql("SELECT key, station, office_id, division, sub_division FROM master"
+                      " ORDER BY division, station")
+    done = set(read_sql("SELECT old_key FROM station_changes")["old_key"])
+    opts = {f"{r.station} | {r.office_id} | {r.division}": r.key
+            for r in master.itertuples() if r.key not in done}
+    if opts:
+        with st.form("station_change_form", clear_on_submit=True):
+            pick = st.selectbox("Old station ID", list(opts))
+            new_id = st.text_input("New station ID")
+            eff = st.date_input("Effective date (first day the new ID is used)",
+                                value=datetime.now().date(), format="DD-MM-YYYY")
+            if st.form_submit_button("Save station ID change"):
+                ok, msg = register_station_change(opts[pick], new_id, eff,
+                                                  st.session_state["user"]["username"])
+                if ok:
+                    flash(msg)
+                else:
+                    st.error(msg)
+    ch = read_sql("SELECT id, old_station, new_station, division, sub_division, effective_date,"
+                  " changed_by, changed_at FROM station_changes ORDER BY id DESC")
+    if ch.empty:
+        return
+    show = ch.assign(effective_date=pd.to_datetime(ch["effective_date"], errors="coerce")
+                     .dt.strftime("%d-%m-%Y")).rename(columns={
+        "id": "ID", "old_station": "Old station ID", "new_station": "New station ID",
+        "division": "Division", "sub_division": "Sub Division", "effective_date": "Effective from",
+        "changed_by": "Changed by", "changed_at": "Changed at"})
+    st.dataframe(show, hide_index=True, use_container_width=True)
+    with st.expander("Undo a station ID change"):
+        labels = {f"#{r.id}: {r.old_station} -> {r.new_station}": r.id for r in ch.itertuples()}
+        pick_u = st.selectbox("Change to undo", list(labels), key="sc_undo_pick")
+        if st.button("Undo this change", key="sc_undo_btn"):
+            ok, msg = undo_station_change(labels[pick_u])
+            if ok:
+                flash(msg)
+            else:
+                st.error(msg)
 
 
 # ---------------------------------------------------------------- camps
@@ -657,7 +889,7 @@ def dashboard():
     if not ids:
         return
 
-    agg, missing, m, _ = build_period(ids)
+    agg, missing, m, _ = build_period_adj(ids)
 
     f1, f2, f3 = st.columns([1, 1, 2])
     dv = f1.selectbox("Division", ["All"] + sorted(set(agg["division"]) | set(m["division"])))
@@ -886,6 +1118,8 @@ def upload_tab():
                 except Exception as e:
                     st.error(str(e))
 
+    station_change_section()
+
     st.subheader("Operator master")
     st.caption("Headers: Operator ID, Operator Name (other columns are ignored). The Operator ID must match the "
                "Session Operator ID in the daily transaction sheet. A new upload replaces the existing "
@@ -975,8 +1209,8 @@ def users_tab():
     st.subheader("Bulk create Division logins")
     if DEFAULT_TEMP_PASSWORD:
         st.caption("Creates one login per Division found in the master sheet. The username is generated "
-                   "from the division's name, the default password for all of them is "
-                   f"\"{DEFAULT_TEMP_PASSWORD}\", and the user must set a new password on first login.")
+                   "from the division's name, all of them get the configured default password, and "
+                   "the user must set a new password on first login.")
     else:
         st.caption("Creates one login per Division found in the master sheet. The username is generated "
                    "from the division's name. No shared default password is configured, so a random "
@@ -987,10 +1221,15 @@ def users_tab():
     elif st.button("Create logins for all Divisions"):
         created, skipped, password = bulk_create_division_users()
         if created:
-            st.success(f"{len(created)} login(s) created. Temporary password for this batch: "
-                       f"**{password}** (must be changed on first login).")
+            st.success(f"{len(created)} login(s) created. Every user must set a new password on "
+                       "first login.")
             st.dataframe(pd.DataFrame(created, columns=["Division", "Username"]),
                          hide_index=True, use_container_width=True)
+            if not DEFAULT_TEMP_PASSWORD:
+                # A random batch password exists nowhere else, so the admin has to
+                # be shown it once or the new logins could never be used.
+                show_password_popup("Temporary password for this batch", "", password,
+                                    f"Give this to the {len(created)} new division login(s).")
         if skipped:
             st.info(f"{len(skipped)} division(s) already had a login, so they were skipped.")
             st.dataframe(pd.DataFrame(skipped, columns=["Division", "Username"]),
@@ -1101,10 +1340,10 @@ def users_tab():
         # Only offered when a shared default is actually configured; otherwise
         # there is nothing to reset to, and offering it would lock the user out.
         if DEFAULT_TEMP_PASSWORD:
-            if st.button(f"Reset to default password ({DEFAULT_TEMP_PASSWORD})"):
+            if st.button("Reset to default password"):
                 set_password(target, DEFAULT_TEMP_PASSWORD, must_change=1)
-                st.success(f"Password reset to {DEFAULT_TEMP_PASSWORD} for {target}. "
-                           "They will need to set a new password on first login.")
+                show_password_popup("Password reset", target, DEFAULT_TEMP_PASSWORD,
+                                    f"Password for {target} has been reset to the default.")
     row = users[users["username"] == target].iloc[0]
     divs = get_divisions()
     cur_div = row["division"] if isinstance(row["division"], str) else ""
@@ -1206,7 +1445,7 @@ def report_tab():
 
     # One call gives both the station and operator aggregates from a single
     # read of master and tx.
-    agg_full, missing, _, _ = build_period(ids)
+    agg_full, missing, _, _ = build_period_adj(ids)
     not_in_master = agg_full[agg_full["division"] == "Not in master"]
     st.caption(f"Stations in daily data: {len(agg_full)} | not found in master: "
                f"{len(not_in_master)} | master stations with no data: {len(missing)}")

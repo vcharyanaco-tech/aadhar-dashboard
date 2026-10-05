@@ -1101,10 +1101,11 @@ def dashboard():
     f1, f2, f3 = st.columns([1, 1, 2])
     dv = f1.selectbox("Division", ["All"] + sorted(set(agg["division"]) | set(m["division"])))
     pool = agg if dv == "All" else agg[agg["division"] == dv]
-    ds = f2.selectbox("District", ["All"] + sorted(d for d in pool["district"].unique() if d))
+    ds = f2.selectbox("Sub Division", ["All"] + sorted(d for d in pool["sub_division"].unique() if d),
+                      key="dash_sub_division")
     q = f3.text_input("Search station, office ID or address (office / machine)").strip().lower()
 
-    v = pool if ds == "All" else pool[pool["district"] == ds]
+    v = pool if ds == "All" else pool[pool["sub_division"] == ds]
     if q:
         blob = (v["station"] + " " + v["office_id"] + " " + v["address"] + " " + v["machine_address"]).str.lower()
         v = v[blob.str.contains(q, regex=False)]
@@ -1397,11 +1398,22 @@ def upload_tab():
             hide_index=True, use_container_width=True)
         pick_id = st.selectbox("Delete an upload", [r["id"] for r in ups],
                                format_func=lambda i: next(r["label"] for r in ups if r["id"] == i))
-        if st.button("Delete selected upload"):
-            label = next((r["label"] for r in ups if r["id"] == pick_id), str(pick_id))
-            n_rows = run("SELECT COUNT(*) n FROM tx WHERE upload_id=?", (pick_id,), one=True)["n"]
-            run("DELETE FROM tx WHERE upload_id=?", (pick_id,))
-            run("DELETE FROM uploads WHERE id=?", (pick_id,))
+        label = next((r["label"] for r in ups if r["id"] == pick_id), str(pick_id))
+        n_rows = run("SELECT COUNT(*) n FROM tx WHERE upload_id=?", (pick_id,), one=True)["n"]
+        st.warning(f"Deleting '{label}' will permanently remove {n_rows:,} transaction row(s) for that "
+                   "day from every report. This cannot be undone (except by re-uploading the sheet).")
+        sure_up = st.checkbox(f"I confirm: delete the upload '{label}' and all its transaction rows",
+                              key=f"del_upload_ok_{pick_id}")
+        if st.button("Delete selected upload", disabled=not sure_up):
+            # One connection and one commit, so a failure cannot leave the
+            # transactions deleted but the upload row behind (or the reverse).
+            con = connect()
+            try:
+                con.execute("DELETE FROM tx WHERE upload_id=?", (pick_id,))
+                con.execute("DELETE FROM uploads WHERE id=?", (pick_id,))
+                con.commit()
+            finally:
+                con.close()
             audit("tx.delete", f"upload '{label}' (#{pick_id}) and {n_rows} transaction row(s)")
             clear_report_cache()
             kv_sync.request_backup()
@@ -1576,7 +1588,7 @@ def users_tab():
         flash("User updated.")
     with b:
         sure = st.checkbox("Confirm delete")
-        if st.button("Delete user") and sure:
+        if st.button("Delete user", disabled=not sure):
             run("DELETE FROM users WHERE username=?", (target,))
             audit("user.delete", target)
             kv_sync.request_backup()
@@ -1824,6 +1836,113 @@ def report_tab():
                              hide_index=True, use_container_width=True)
         st.download_button("Download Not Working Stations CSV", nw.to_csv(index=False).encode("utf-8-sig"),
                            "haryana_circle_not_working_stations.csv", "text/csv", key="dl_not_working")
+
+    day_wise_analysis(ids, uploads)
+
+
+def day_wise_analysis(ids, uploads):
+    """Day-by-day view of the selected period: totals, working stations, target and trend.
+
+    Each selected upload is aggregated on its own (build_period_adj is cached per id
+    list), so station ID changes and transfers are applied exactly as in the other
+    report sections. Non-working days (per split_working_days) get a target of zero.
+    """
+    st.divider()
+    st.subheader("Day-wise Analysis")
+    if len(ids) < 2:
+        st.info("Select two or more days (Date range or Specific uploads) to see the day-wise analysis.")
+        return
+    label_by_id = {r["id"]: r["label"] for r in uploads}
+    days = sorted(((parse_label_date(label_by_id.get(i)), i) for i in ids),
+                  key=lambda x: (x[0] is None, x[0] or date.min, x[1]))
+    lookup = _target_lookup_cached()
+
+    per_day = []
+    with st.spinner("Preparing day-wise figures..."):
+        for d, i in days:
+            agg_d, miss_d, _, _ = build_period_adj([i])
+            name = d.strftime("%d-%m-%Y") if d else str(label_by_id.get(i))
+            per_day.append((d, name, agg_d, miss_d))
+
+    all_divs = sorted({x for _, _, a, m in per_day for x in (set(a["division"]) | set(m["division"]))
+                       if x and x != "Not in master"})
+    dv = st.selectbox("Division", ["All"] + all_divs, key="dw_div")
+
+    rows, long_rows = [], []
+    for d, name, agg_d, miss_d in per_day:
+        if dv != "All":
+            agg_d, miss_d = agg_d[agg_d["division"] == dv], miss_d[miss_d["division"] == dv]
+        total = int(agg_d["total"].sum())
+        working = int((agg_d["total"] > 0).sum())
+        all_st = len(agg_d) + len(miss_d)
+        is_working_day = True if d is None else split_working_days([d])[0] > 0
+        divs_in_view = {x for x in (set(agg_d["division"]) | set(miss_d["division"]))
+                        if x and x != "Not in master"}
+        target = sum(lookup.get(parsers.norm(x), 0) for x in divs_in_view) if is_working_day else 0
+        rows.append({
+            "Date": name, "Day": d.strftime("%a") if d else "",
+            "Total": total, "New Enrolment": int(agg_d["enr"].sum()), "Updates": int(agg_d["upd"].sum()),
+            "Working Stations": working, "Not Working Stations": all_st - working,
+            "Target": int(target),
+            "% Achieved": round(total * 100 / target, 1) if target else None,
+            "Working day": "Yes" if is_working_day else "No (closed)",
+        })
+        for div_name, g in agg_d[agg_d["division"] != "Not in master"].groupby("division"):
+            long_rows.append({"Date": name, "Division": div_name, "Total": int(g["total"].sum())})
+
+    day_df = pd.DataFrame(rows)
+    order = day_df["Date"].tolist()
+
+    working_df = day_df[day_df["Working day"] == "Yes"]
+    k = st.columns(4)
+    k[0].metric("Total in period", f"{int(day_df['Total'].sum()):,}")
+    k[1].metric("Average per working day",
+                f"{(working_df['Total'].sum() / max(len(working_df), 1)):,.0f}")
+    if len(working_df):
+        best = working_df.loc[working_df["Total"].idxmax()]
+        worst = working_df.loc[working_df["Total"].idxmin()]
+        k[2].metric("Best working day", f"{int(best['Total']):,}", best["Date"], delta_color="off")
+        k[3].metric("Lowest working day", f"{int(worst['Total']):,}", worst["Date"], delta_color="off")
+
+    fig = _plotly().bar(day_df, x="Date", y="Total", text="Total", color="Working day",
+                        color_discrete_map={"Yes": "#7A1F2B", "No (closed)": "#B0B0B0"},
+                        category_orders={"Date": order},
+                        title="Day-wise transactions" + (f" - {dv}" if dv != "All" else ""))
+    fig.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
+    if day_df["Target"].sum() > 0:
+        fig.add_scatter(x=day_df["Date"], y=day_df["Target"], mode="lines+markers",
+                        name="Daily target", line=dict(color="#C97B1E", dash="dash"))
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Target = sum of the approved daily targets of the divisions in view. Closed days (Sundays and "
+               "other non-working days) have no target; transactions on those days still count in the totals.")
+
+    st.dataframe(day_df, hide_index=True, use_container_width=True)
+    d1, d2 = st.columns(2)
+    d1.download_button("Download Day-wise CSV", day_df.to_csv(index=False).encode("utf-8-sig"),
+                       "haryana_circle_daywise.csv", "text/csv", key="dw_dl_csv")
+    with d2:
+        excel_download(day_df, "Day-wise", "haryana_circle_daywise.xlsx", "Download Day-wise Excel",
+                       bold_last_row=False)
+
+    if long_rows:
+        st.markdown("**Division-wise, day by day**")
+        long_df = pd.DataFrame(long_rows)
+        if dv != "All":
+            long_df = long_df[long_df["Division"] == dv]
+        fig2 = _plotly().line(long_df, x="Date", y="Total", color="Division", markers=True,
+                              category_orders={"Date": order}, title="Division-wise daily trend")
+        st.plotly_chart(fig2, use_container_width=True)
+        piv = (long_df.pivot_table(index="Division", columns="Date", values="Total", aggfunc="sum",
+                                   fill_value=0).reindex(columns=order, fill_value=0))
+        piv["Total"] = piv.sum(axis=1)
+        piv = piv.reset_index()
+        st.dataframe(piv, hide_index=True, use_container_width=True)
+        e1, e2 = st.columns(2)
+        e1.download_button("Download Division x Day CSV", piv.to_csv(index=False).encode("utf-8-sig"),
+                           "haryana_circle_division_by_day.csv", "text/csv", key="dw_piv_csv")
+        with e2:
+            excel_download(piv, "Division x Day", "haryana_circle_division_by_day.xlsx",
+                           "Download Division x Day Excel", bold_last_row=False)
 
 
 def camp_entry_form():
@@ -2109,7 +2228,8 @@ def camps_tab():
             opts = {f"{r['camp_date']} - {r['location']} ({r['division']}/{r['sub_division']}) #{r['id']}": r["id"]
                     for _, r in pool.iterrows()}
             pick = st.selectbox("Select entry", list(opts), key="camp_del_pick")
-            if st.button("Delete this entry"):
+            sure_camp = st.checkbox("I confirm: delete this camp entry", key=f"camp_del_ok_{opts[pick]}")
+            if st.button("Delete this entry", disabled=not sure_camp):
                 run("DELETE FROM camps WHERE id=?", (opts[pick],))
                 audit("camp.delete", opts[pick])
                 kv_sync.request_backup()

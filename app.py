@@ -512,7 +512,7 @@ def clear_report_cache():
     deliberately do not clear this. The TTL is a safety net, not the mechanism:
     an admin uploading a sheet should see it immediately, not after five minutes.
     """
-    for name in ("build_period", "machine_address_map"):
+    for name in ("build_period", "machine_address_map", "station_operator_map"):
         try:
             globals()[name].clear()
         except Exception:
@@ -1089,8 +1089,14 @@ def dashboard():
     if not ids:
         return
 
-    agg, missing, m, _ = build_period_adj(ids)
+    agg, missing, m, ops = build_period_adj(ids)
     agg = agg.assign(machine_address=agg["key"].map(machine_address_map(tuple(ids))).fillna(""))
+    # Operator name(s) per station ID. Falls back to the operator ID when the
+    # operator master has no name for it.
+    _name_by_op = {str(o).strip().upper(): n for o, n in zip(ops["operator"], ops["operator_name"]) if n}
+    _ops_by_key = station_operator_map(tuple(ids))
+    agg = agg.assign(operator_name=agg["key"].map(
+        lambda k: ", ".join(_name_by_op.get(o.upper(), o) for o in _ops_by_key.get(k, []))))
 
     f1, f2, f3 = st.columns([1, 1, 2])
     dv = f1.selectbox("Division", ["All"] + sorted(set(agg["division"]) | set(m["division"])))
@@ -1113,11 +1119,11 @@ def dashboard():
 
     show = v.rename(columns={"station": "Station", "office_id": "Office ID", "division": "Division",
                              "sub_division": "Sub Division", "district": "District",
-                             "address": "Office address", "machine_address": "Machine address",
+                             "address": "Office address", "operator_name": "Operator Name",
                              "machines": "Machines",
                              "enr": "New enrolment", "mbu": "MBU", "demo": "Demographic updates",
                              "nonmbu": "Non-MBU", "upd": "Updates", "total": "Total"})
-    cols = ["Station", "Office ID", "Division", "Sub Division", "District", "Office address", "Machine address", "Machines",
+    cols = ["Station", "Office ID", "Operator Name", "Division", "Sub Division", "District", "Office address", "Machines",
             "New enrolment", "MBU", "Demographic updates", "Non-MBU", "Updates", "Total"]
     show = show[cols].sort_values("Total", ascending=False)
 
@@ -1620,6 +1626,29 @@ def machine_address_map(ids):
             return {}
         df["address"] = df["address"].astype(str).str.strip()
         return df.groupby("key")["address"].agg(lambda s: " | ".join(sorted(set(s)))).to_dict()
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def station_operator_map(ids):
+    """key -> list of operator IDs who worked that station in the selected uploads.
+
+    The operator column in `tx` is looked up by name because it depends on how
+    parsers.save_tx stored it. Returns {} if no such column exists.
+    """
+    try:
+        cols = {r["name"] for r in run("PRAGMA table_info(tx)", many=True)}
+        col = next((c for c in ("operator", "operator_id", "session_operator_id") if c in cols), None)
+        if not col:
+            return {}
+        marks = ",".join("?" * len(ids))
+        df = read_sql(f"SELECT DISTINCT key, {col} AS op FROM tx WHERE upload_id IN ({marks})"
+                      f" AND {col} IS NOT NULL AND TRIM({col}) <> ''", tuple(ids))
+        if df.empty:
+            return {}
+        df["op"] = df["op"].astype(str).str.strip()
+        return df.groupby("key")["op"].agg(lambda x: sorted(set(x))).to_dict()
     except Exception:
         return {}
 

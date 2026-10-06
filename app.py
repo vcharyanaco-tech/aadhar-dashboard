@@ -196,6 +196,16 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT, station TEXT, office_id TEXT,
         old_division TEXT, old_sub_division TEXT, new_division TEXT, new_sub_division TEXT,
         effective_date TEXT, changed_by TEXT, changed_at TEXT)""")
+    # MBU camps: the camp list comes from an admin-uploaded monthly sheet; only
+    # transactions and remarks are ever edited. dedupe_key keeps a re-uploaded
+    # sheet from creating the same camp twice (or overwriting its entries).
+    run("""CREATE TABLE IF NOT EXISTS mbu_camp_batches(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT, uploaded_by TEXT, uploaded_at TEXT,
+        rows_in_file INTEGER, rows_added INTEGER DEFAULT 0)""")
+    run("""CREATE TABLE IF NOT EXISTS mbu_camps(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER, camp_date TEXT, division TEXT,
+        location TEXT, transactions INTEGER, remarks TEXT, dedupe_key TEXT UNIQUE,
+        created_by TEXT, created_at TEXT, updated_by TEXT, updated_at TEXT)""")
     con = connect()
     try:
         parsers.ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0", "division": "TEXT"})
@@ -1121,10 +1131,9 @@ def dashboard():
     show = v.rename(columns={"station": "Station", "office_id": "Office ID", "division": "Division",
                              "sub_division": "Sub Division", "district": "District",
                              "address": "Office address", "operator_name": "Operator Name",
-                             "machines": "Machines",
                              "enr": "New enrolment", "mbu": "MBU", "demo": "Demographic updates",
                              "nonmbu": "Non-MBU", "upd": "Updates", "total": "Total"})
-    cols = ["Station", "Office ID", "Operator Name", "Division", "Sub Division", "District", "Office address", "Machines",
+    cols = ["Station", "Office ID", "Operator Name", "Division", "Sub Division", "District", "Office address",
             "New enrolment", "MBU", "Demographic updates", "Non-MBU", "Updates", "Total"]
     show = show[cols].sort_values("Total", ascending=False)
 
@@ -2054,7 +2063,376 @@ def backup_tab():
                "(or `generations`).")
 
 
+# ---------------------------------------------------------------- MBU camps
+# A monthly plan sheet (Division, Camp Location, Camp Date) is uploaded by the admin.
+# Those three columns are fixed: nobody can edit them afterwards. Division users
+# (and the admin) fill only "Number of Transactions" and "Remarks" per camp.
+#
+# Designed for a sheet that arrives roughly every month:
+#   * each upload is a batch; new camps are ADDED, existing ones are never overwritten,
+#     so re-uploading a sheet (or a corrected one) cannot wipe entries already made;
+#   * a camp is identified by (date, division, location), enforced by a UNIQUE key;
+#   * the screen is filtered by month (latest month first) so old months stay out of the way;
+#   * the admin can delete a wrong row or a whole batch.
+def _nk(s):
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+
+_MBU_HEADERS = {
+    "division": ("division", "divison", "divisionname", "divisonname"),
+    "location": ("location", "camplocation", "camplocationname", "campplace", "venue", "place"),
+    "date": ("date", "campdate", "dateofcamp"),
+}
+_MBU_TXN, _MBU_REM = "Number of Transactions", "Remarks"
+
+
+def _mbu_col_map(values):
+    found = {}
+    for idx, c in enumerate(values):
+        k = _nk(c)
+        for field, names in _MBU_HEADERS.items():
+            if k in names and field not in found:
+                found[field] = idx
+    return found
+
+
+def _parse_camp_date(v):
+    if v is None or pd.isna(v) or str(v).strip() == "":
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and 20000 < float(v) < 80000:
+        return (datetime(1899, 12, 30) + timedelta(days=float(v))).date()
+    d = pd.to_datetime(str(v).strip(), dayfirst=True, errors="coerce")
+    return None if pd.isna(d) else d.date()
+
+
+def parse_mbu_sheet(f, master_divisions):
+    """Read an uploaded MBU camp sheet. Returns (rows, problems, dup_in_file).
+
+    The header row is searched in the first 15 rows, so a title line above the
+    table does not matter. Every problem row is listed; the caller refuses the
+    whole file if there is any, so nothing is silently dropped.
+    """
+    if f.name.lower().endswith(".csv"):
+        raw = pd.read_csv(f, header=None, dtype=object, encoding_errors="replace")
+    else:
+        raw = pd.read_excel(f, header=None, dtype=object)
+    head, cmap = None, {}
+    for i in range(min(15, len(raw))):
+        cm = _mbu_col_map(raw.iloc[i].tolist())
+        if len(cm) == 3:
+            head, cmap = i, cm
+            break
+    if head is None:
+        raise ValueError("Header row not found. The sheet must have these columns: "
+                         "Division, Camp Location, Camp Date.")
+    canon = {parsers.norm(d): d for d in master_divisions}
+    rows, problems, seen, dup = [], [], set(), 0
+    for idx in range(head + 1, len(raw)):
+        r = raw.iloc[idx].tolist()
+        dv_raw, loc_raw, dt_raw = r[cmap["division"]], r[cmap["location"]], r[cmap["date"]]
+        if all((x is None or pd.isna(x) or str(x).strip() == "") for x in (dv_raw, loc_raw, dt_raw)):
+            continue  # blank line
+        n = idx + 1  # row number as Excel shows it
+        dv_txt = "" if pd.isna(dv_raw) else str(dv_raw).strip()
+        loc = "" if pd.isna(loc_raw) else re.sub(r"\s+", " ", str(loc_raw)).strip()
+        d = _parse_camp_date(dt_raw)
+        div = canon.get(parsers.norm(dv_txt))
+        if not dv_txt or div is None:
+            problems.append(f"Row {n}: Division '{dv_txt}' is not in the master sheet.")
+        if not loc:
+            problems.append(f"Row {n}: Camp Location is empty.")
+        if d is None:
+            problems.append(f"Row {n}: Camp Date '{dt_raw}' is not a valid date.")
+        if not (div and loc and d):
+            continue
+        key = f"{d.isoformat()}|{_nk(div)}|{_nk(loc)}"
+        if key in seen:
+            dup += 1
+            continue
+        seen.add(key)
+        rows.append({"division": div, "location": loc, "date": d.isoformat(), "key": key})
+    if not rows and not problems:
+        problems.append("No camp rows found below the header.")
+    return rows, problems, dup
+
+
+def save_mbu_batch(rows, filename, by):
+    """Add the new camps of one uploaded sheet. Returns (added, already_existing)."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    con = connect()
+    try:
+        cur = con.execute("INSERT INTO mbu_camp_batches(filename, uploaded_by, uploaded_at, rows_in_file)"
+                          " VALUES (?,?,?,?)", (filename, by, now, len(rows)))
+        batch_id, added = cur.lastrowid, 0
+        for r in rows:
+            c = con.execute(
+                "INSERT OR IGNORE INTO mbu_camps(batch_id, camp_date, division, location, dedupe_key,"
+                " created_by, created_at) VALUES (?,?,?,?,?,?,?)",
+                (batch_id, r["date"], r["division"], r["location"], r["key"], by, now))
+            added += c.rowcount
+        if added == 0:
+            con.rollback()  # nothing new: do not leave an empty batch behind
+        else:
+            con.execute("UPDATE mbu_camp_batches SET rows_added=? WHERE id=?", (added, batch_id))
+            con.commit()
+    finally:
+        con.close()
+    if added:
+        audit("mbu_camp.upload", f"{filename}: {added} new, {len(rows) - added} already existed")
+        kv_sync.request_backup()
+    return added, len(rows) - added
+
+
+def update_mbu_entries(changes, by):
+    """Save Number of Transactions / Remarks. changes = {id: (transactions|None, remarks)}.
+
+    The division check is repeated here, not left to the editor widget: a
+    non-admin can only change rows of the division their login is linked to.
+    """
+    admin = is_admin()
+    mine = parsers.norm(user_division() or "")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    saved = 0
+    con = connect()
+    try:
+        for cid, (txn, rem) in changes.items():
+            row = con.execute("SELECT division FROM mbu_camps WHERE id=?", (cid,)).fetchone()
+            if row is None or (not admin and parsers.norm(row["division"]) != mine):
+                continue
+            con.execute("UPDATE mbu_camps SET transactions=?, remarks=?, updated_by=?, updated_at=? WHERE id=?",
+                        (txn, rem, by, now, cid))
+            saved += 1
+        con.commit()
+    finally:
+        con.close()
+    if saved:
+        audit("mbu_camp.entry", f"{saved} camp row(s) updated")
+        kv_sync.request_backup()
+    return saved
+
+
+def _month_label(m):
+    if m == "ALL":
+        return "All months"
+    try:
+        return datetime.strptime(m + "-01", "%Y-%m-%d").strftime("%B %Y")
+    except ValueError:
+        return m
+
+
+def mbu_upload_panel():
+    if not is_admin():  # server-side guard
+        return
+    with st.expander("Upload MBU camp sheet (admin)"):
+        st.caption("Columns: Division, Camp Location, Camp Date. Upload one sheet per month. Camps already "
+                   "present (same date + division + location) are left untouched, so entries already made "
+                   "are never lost; only new camps are added. Division names must match the master sheet. "
+                   "If a date or location was wrong in an earlier upload, delete that row below and upload again.")
+        st.download_button("Download sample format (CSV)",
+                           "Division,Camp Location,Camp Date\nSample Division,Sample Post Office,15-11-2026\n"
+                           .encode("utf-8-sig"), "mbu_camps_sample.csv", "text/csv", key="mbu_sample_dl")
+        if not get_divisions():
+            st.info("Upload the master sheet first, so division names can be checked.")
+            return
+        with st.form("mbu_upload_form", clear_on_submit=True):
+            f = st.file_uploader("MBU camp sheet", type=["xlsx", "xls", "csv"], key="mbu_uploader")
+            if f is not None:
+                st.caption(f"Selected file: **{f.name}** ({f.size / 1024:.1f} KB) - ready to save.")
+            if st.form_submit_button("Save MBU camp sheet"):
+                if not f:
+                    st.warning("No file detected. Please choose the file again, wait until its name appears "
+                               "above, then click 'Save MBU camp sheet' again.")
+                else:
+                    try:
+                        rows, problems, dup = parse_mbu_sheet(f, get_divisions())
+                    except Exception as e:
+                        st.error(f"Could not read the file: {e}")
+                    else:
+                        if problems:
+                            st.error(f"{len(problems)} problem(s) found - nothing was saved. Fix the sheet "
+                                     "and upload again.")
+                            st.code("\n".join(problems[:30]) + (f"\n... and {len(problems) - 30} more"
+                                                                if len(problems) > 30 else ""), language=None)
+                        else:
+                            added, existed = save_mbu_batch(rows, f.name, st.session_state["user"]["username"])
+                            msg = f"MBU camp sheet saved: {added} new camp(s) added"
+                            if existed:
+                                msg += f", {existed} already existed (kept as they are)"
+                            if dup:
+                                msg += f", {dup} duplicate row(s) inside the file ignored"
+                            flash(msg + ".")
+
+    batches = read_sql("SELECT b.id, b.filename, b.uploaded_by, b.uploaded_at, b.rows_added,"
+                       " (SELECT COUNT(*) FROM mbu_camps c WHERE c.batch_id=b.id AND c.transactions IS NOT NULL)"
+                       " AS entered FROM mbu_camp_batches b ORDER BY b.id DESC")
+    if batches.empty:
+        return
+    with st.expander("Uploaded MBU sheets / delete (admin)"):
+        st.dataframe(batches.rename(columns={"id": "ID", "filename": "File", "uploaded_by": "Uploaded by",
+                                             "uploaded_at": "Uploaded at", "rows_added": "Camps added",
+                                             "entered": "Entries made so far"}),
+                     hide_index=True, use_container_width=True)
+        opts = {f"#{r.id}: {r.filename} ({r.uploaded_at})": r.id for r in batches.itertuples()}
+        pick = st.selectbox("Sheet to delete", list(opts), key="mbu_del_batch_pick")
+        bid = opts[pick]
+        n_entered = int(batches.loc[batches["id"] == bid, "entered"].iloc[0])
+        st.warning(f"This removes all camps added by that sheet, including {n_entered} entr"
+                   f"{'y' if n_entered == 1 else 'ies'} already made on them.")
+        ok = st.checkbox("I confirm: delete this sheet and its camps", key=f"mbu_del_batch_ok_{bid}")
+        if st.button("Delete sheet", disabled=not ok, key="mbu_del_batch_btn"):
+            run("DELETE FROM mbu_camps WHERE batch_id=?", (bid,))
+            run("DELETE FROM mbu_camp_batches WHERE id=?", (bid,))
+            audit("mbu_camp.delete_batch", f"sheet #{bid} ({n_entered} entries)")
+            kv_sync.request_backup()
+            flash("MBU camp sheet deleted.")
+
+
+def mbu_camps_section():
+    mbu_upload_panel()
+    df = read_sql("SELECT id, camp_date, division, location, transactions, remarks, updated_by, updated_at"
+                  " FROM mbu_camps ORDER BY camp_date, division, location")
+    if df.empty:
+        st.info("No MBU camp sheet has been uploaded yet." + (" Please contact the admin." if not is_admin() else ""))
+        return
+    df["transactions"] = pd.to_numeric(df["transactions"], errors="coerce")  # all-NULL column arrives as object
+    df["_month"] = df["camp_date"].str[:7]
+    months = sorted(df["_month"].unique(), reverse=True)  # latest month first = the default view
+
+    f1, f2, f3 = st.columns(3)
+    month = f1.selectbox("Month", months + ["ALL"], format_func=_month_label, key="mbu_month")
+    dv = f2.selectbox("Division", ["All"] + sorted(df["division"].unique()), key="mbu_div")
+    status = f3.selectbox("Status", ["All", "Pending (not entered)", "Entered"], key="mbu_status")
+    pool = df if month == "ALL" else df[df["_month"] == month]
+    if dv != "All":
+        pool = pool[pool["division"] == dv]
+    if status.startswith("Pending"):
+        pool = pool[pool["transactions"].isna()]
+    elif status == "Entered":
+        pool = pool[pool["transactions"].notna()]
+
+    k = st.columns(4)
+    k[0].metric("Camps", f"{len(pool):,}")
+    k[1].metric("Entries made", f"{int(pool['transactions'].notna().sum()):,}")
+    k[2].metric("Pending", f"{int(pool['transactions'].isna().sum()):,}")
+    k[3].metric("Total transactions", f"{int(pool['transactions'].fillna(0).sum()):,}")
+
+    # ---- entry grid: only Transactions and Remarks can be changed
+    st.subheader("Enter transactions")
+    if is_admin():
+        editable = pool
+    else:
+        my_div = user_division()
+        if not my_div:
+            st.warning("Your login is not linked to any Division, so you cannot enter MBU camp figures. "
+                       "Please contact the admin.")
+            editable = pool.iloc[0:0]
+        else:
+            editable = pool[pool["division"].map(parsers.norm) == parsers.norm(my_div)]
+            st.caption(f"You can fill only the camps of your own Division ({my_div}). "
+                       "Other divisions are visible in the report below.")
+    if editable.empty:
+        st.info("No camps to fill for the selected filters.")
+    else:
+        st.caption("Division, Camp Location and Camp Date are fixed. Fill Number of Transactions and "
+                   "Remarks, then click Save entries.")
+        g = editable.set_index("id")[["division", "location", "camp_date", "transactions", "remarks"]].copy()
+        g["camp_date"] = pd.to_datetime(g["camp_date"]).dt.strftime("%d-%m-%Y")
+        g["transactions"] = pd.to_numeric(g["transactions"], errors="coerce").astype("Int64")
+        g["remarks"] = g["remarks"].fillna("")
+        g.columns = ["Division", "Camp Location", "Camp Date", _MBU_TXN, _MBU_REM]
+        ver = st.session_state.get("mbu_ver", 0)  # new key after a save, so stale edits are not replayed
+        edited = st.data_editor(
+            g, hide_index=True, use_container_width=True, num_rows="fixed",
+            disabled=["Division", "Camp Location", "Camp Date"],
+            column_config={_MBU_TXN: st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
+                           _MBU_REM: st.column_config.TextColumn(max_chars=300)},
+            key=f"mbu_grid_{ver}_{month}_{dv}_{status}")
+
+        changes, bad = {}, []
+        for cid in g.index:
+            o_t = None if pd.isna(g.at[cid, _MBU_TXN]) else int(g.at[cid, _MBU_TXN])
+            o_r = str(g.at[cid, _MBU_REM] or "").strip()
+            raw_t, raw_r = edited.at[cid, _MBU_TXN], edited.at[cid, _MBU_REM]
+            n_r = "" if raw_r is None or pd.isna(raw_r) else str(raw_r).strip()
+            if raw_t is None or pd.isna(raw_t):
+                n_t = None
+            elif float(raw_t) != int(raw_t) or float(raw_t) < 0:
+                bad.append(f"{g.at[cid, 'Camp Location']} ({g.at[cid, 'Camp Date']})")
+                continue
+            else:
+                n_t = int(raw_t)
+            if (o_t, o_r) != (n_t, n_r):
+                changes[int(cid)] = (n_t, n_r)
+        if bad:
+            st.error("Number of Transactions must be a whole number, 0 or more: " + "; ".join(bad))
+        st.caption(f"{len(changes)} row(s) changed." if changes else "No unsaved changes.")
+        if st.button("Save entries", type="primary", disabled=not changes or bool(bad), key="mbu_save"):
+            n = update_mbu_entries(changes, st.session_state["user"]["username"])
+            st.session_state["mbu_ver"] = ver + 1
+            flash(f"{n} MBU camp entr{'y' if n == 1 else 'ies'} saved.")
+
+    # ---- read-only report for everyone
+    st.divider()
+    st.subheader("MBU camp report")
+    show = pool.assign(camp_date=pd.to_datetime(pool["camp_date"]).dt.strftime("%d-%m-%Y"),
+                       transactions=pool["transactions"].astype("Int64"),
+                       remarks=pool["remarks"].fillna("")
+                       )[["division", "location", "camp_date", "transactions", "remarks", "updated_by", "updated_at"]]
+    show = show.rename(columns={"division": "Division", "location": "Camp Location", "camp_date": "Camp Date",
+                                "transactions": _MBU_TXN, "remarks": _MBU_REM,
+                                "updated_by": "Last updated by", "updated_at": "Last updated at"})
+    st.dataframe(show, hide_index=True, use_container_width=True)
+    d1, d2 = st.columns(2)
+    d1.download_button("Download CSV", show.to_csv(index=False).encode("utf-8-sig"),
+                       "mbu_camp_report.csv", "text/csv", key="mbu_dl_csv")
+    with d2:
+        excel_download(show, "MBU Camps", "mbu_camp_report.xlsx", "Download Excel", bold_last_row=False)
+
+    st.subheader("Division-wise MBU camp summary")
+    summ = (pool.groupby("division", as_index=False)
+            .agg(camps=("id", "size"), entered=("transactions", "count"),
+                 transactions=("transactions", "sum")).sort_values("division"))
+    summ["pending"] = summ["camps"] - summ["entered"]
+    summ = summ[["division", "camps", "entered", "pending", "transactions"]]
+    summ.columns = ["Division", "Camps", "Entries made", "Pending", "Total Transactions"]
+    for c in summ.columns[1:]:
+        summ[c] = summ[c].fillna(0).astype(int)
+    grand = pd.DataFrame([["Grand Total"] + [int(summ[c].sum()) for c in summ.columns[1:]]], columns=summ.columns)
+    summ_out = pd.concat([summ, grand], ignore_index=True)
+    st.dataframe(summ_out, hide_index=True, use_container_width=True)
+    e1, e2 = st.columns(2)
+    e1.download_button("Download CSV", summ_out.to_csv(index=False).encode("utf-8-sig"),
+                       "mbu_camp_division_summary.csv", "text/csv", key="mbu_summ_csv")
+    with e2:
+        excel_download(summ_out, "MBU Summary", "mbu_camp_division_summary.xlsx", "Download Excel")
+
+    if is_admin() and len(pool):
+        with st.expander("Delete a single MBU camp row (admin)"):
+            opts = {f"{r['camp_date']} - {r['location']} ({r['division']}) #{r['id']}": r["id"]
+                    for _, r in pool.iterrows()}
+            pick = st.selectbox("Select camp", list(opts), key="mbu_del_row_pick")
+            ok = st.checkbox("I confirm: delete this camp row", key=f"mbu_del_row_ok_{opts[pick]}")
+            if st.button("Delete this camp", disabled=not ok, key="mbu_del_row_btn"):
+                run("DELETE FROM mbu_camps WHERE id=?", (opts[pick],))
+                audit("mbu_camp.delete", opts[pick])
+                kv_sync.request_backup()
+                flash("MBU camp row deleted.")
+
+
 def camps_tab():
+    section = st.radio("Camps", ["Camps", "MBU Camps"], horizontal=True, key="camps_section",
+                       label_visibility="collapsed")
+    if section == "MBU Camps":
+        mbu_camps_section()
+    else:
+        general_camps_section()
+
+
+def general_camps_section():
     camp_entry_form()
     st.divider()
     st.subheader("Camp reports")

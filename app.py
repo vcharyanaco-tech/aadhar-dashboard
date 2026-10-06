@@ -204,11 +204,12 @@ def init_db():
         rows_in_file INTEGER, rows_added INTEGER DEFAULT 0)""")
     run("""CREATE TABLE IF NOT EXISTS mbu_camps(
         id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER, camp_date TEXT, division TEXT,
-        location TEXT, transactions INTEGER, remarks TEXT, dedupe_key TEXT UNIQUE,
+        district TEXT, location TEXT, transactions INTEGER, remarks TEXT, dedupe_key TEXT UNIQUE,
         created_by TEXT, created_at TEXT, updated_by TEXT, updated_at TEXT)""")
     con = connect()
     try:
         parsers.ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0", "division": "TEXT"})
+        parsers.ensure_cols(con, "mbu_camps", {"district": "TEXT"})  # added after the first MBU release
         # The report queries filter on tx.upload_id and join on tx.key; without
         # these every page load is a full scan of a table that grows daily.
         parsers.ensure_indexes(con)
@@ -2080,6 +2081,7 @@ def _nk(s):
 
 _MBU_HEADERS = {
     "division": ("division", "divison", "divisionname", "divisonname"),
+    "district": ("district", "districtname", "distt", "dist"),
     "location": ("location", "camplocation", "camplocationname", "campplace", "venue", "place"),
     "date": ("date", "campdate", "dateofcamp"),
 }
@@ -2123,12 +2125,12 @@ def parse_mbu_sheet(f, master_divisions):
     head, cmap = None, {}
     for i in range(min(15, len(raw))):
         cm = _mbu_col_map(raw.iloc[i].tolist())
-        if len(cm) == 3:
+        if all(k in cm for k in ("division", "location", "date")):  # District is optional
             head, cmap = i, cm
             break
     if head is None:
         raise ValueError("Header row not found. The sheet must have these columns: "
-                         "Division, Camp Location, Camp Date.")
+                         "Division, District, Camp Location, Camp Date.")
     canon = {parsers.norm(d): d for d in master_divisions}
     rows, problems, seen, dup = [], [], set(), 0
     for idx in range(head + 1, len(raw)):
@@ -2137,6 +2139,8 @@ def parse_mbu_sheet(f, master_divisions):
         if all((x is None or pd.isna(x) or str(x).strip() == "") for x in (dv_raw, loc_raw, dt_raw)):
             continue  # blank line
         n = idx + 1  # row number as Excel shows it
+        dist_raw = r[cmap["district"]] if "district" in cmap else ""
+        district = "" if dist_raw is None or pd.isna(dist_raw) else re.sub(r"\s+", " ", str(dist_raw)).strip()
         dv_txt = "" if pd.isna(dv_raw) else str(dv_raw).strip()
         loc = "" if pd.isna(loc_raw) else re.sub(r"\s+", " ", str(loc_raw)).strip()
         d = _parse_camp_date(dt_raw)
@@ -2154,7 +2158,7 @@ def parse_mbu_sheet(f, master_divisions):
             dup += 1
             continue
         seen.add(key)
-        rows.append({"division": div, "location": loc, "date": d.isoformat(), "key": key})
+        rows.append({"division": div, "district": district, "location": loc, "date": d.isoformat(), "key": key})
     if not rows and not problems:
         problems.append("No camp rows found below the header.")
     return rows, problems, dup
@@ -2170,12 +2174,18 @@ def save_mbu_batch(rows, filename, by):
         batch_id, added = cur.lastrowid, 0
         for r in rows:
             c = con.execute(
-                "INSERT OR IGNORE INTO mbu_camps(batch_id, camp_date, division, location, dedupe_key,"
-                " created_by, created_at) VALUES (?,?,?,?,?,?,?)",
-                (batch_id, r["date"], r["division"], r["location"], r["key"], by, now))
+                "INSERT OR IGNORE INTO mbu_camps(batch_id, camp_date, division, district, location, dedupe_key,"
+                " created_by, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (batch_id, r["date"], r["division"], r["district"], r["location"], r["key"], by, now))
             added += c.rowcount
+            if c.rowcount == 0 and r["district"]:
+                # Camp already exists: only fill a blank district (e.g. camps loaded before
+                # the District column existed). Transactions/remarks are never touched.
+                con.execute("UPDATE mbu_camps SET district=? WHERE dedupe_key=?"
+                            " AND (district IS NULL OR district='')", (r["district"], r["key"]))
         if added == 0:
-            con.rollback()  # nothing new: do not leave an empty batch behind
+            con.execute("DELETE FROM mbu_camp_batches WHERE id=?", (batch_id,))  # no empty batch left behind
+            con.commit()  # keeps any blank districts that were filled in
         else:
             con.execute("UPDATE mbu_camp_batches SET rows_added=? WHERE id=?", (added, batch_id))
             con.commit()
@@ -2228,12 +2238,12 @@ def mbu_upload_panel():
     if not is_admin():  # server-side guard
         return
     with st.expander("Upload MBU camp sheet (admin)"):
-        st.caption("Columns: Division, Camp Location, Camp Date. Upload one sheet per month. Camps already "
+        st.caption("Columns: Division, District, Camp Location, Camp Date. Upload one sheet per month. Camps already "
                    "present (same date + division + location) are left untouched, so entries already made "
                    "are never lost; only new camps are added. Division names must match the master sheet. "
                    "If a date or location was wrong in an earlier upload, delete that row below and upload again.")
         st.download_button("Download sample format (CSV)",
-                           "Division,Camp Location,Camp Date\nSample Division,Sample Post Office,15-11-2026\n"
+                           "Division,District,Camp Location,Camp Date\nSample Division,Sample District,Sample Post Office,15-11-2026\n"
                            .encode("utf-8-sig"), "mbu_camps_sample.csv", "text/csv", key="mbu_sample_dl")
         if not get_divisions():
             st.info("Upload the master sheet first, so division names can be checked.")
@@ -2293,12 +2303,13 @@ def mbu_upload_panel():
 
 def mbu_camps_section():
     mbu_upload_panel()
-    df = read_sql("SELECT id, camp_date, division, location, transactions, remarks, updated_by, updated_at"
+    df = read_sql("SELECT id, camp_date, division, district, location, transactions, remarks, updated_by, updated_at"
                   " FROM mbu_camps ORDER BY camp_date, division, location")
     if df.empty:
         st.info("No MBU camp sheet has been uploaded yet." + (" Please contact the admin." if not is_admin() else ""))
         return
     df["transactions"] = pd.to_numeric(df["transactions"], errors="coerce")  # all-NULL column arrives as object
+    df["district"] = df["district"].fillna("")
     df["_month"] = df["camp_date"].str[:7]
     months = sorted(df["_month"].unique(), reverse=True)  # latest month first = the default view
 
@@ -2337,17 +2348,17 @@ def mbu_camps_section():
     if editable.empty:
         st.info("No camps to fill for the selected filters.")
     else:
-        st.caption("Division, Camp Location and Camp Date are fixed. Fill Number of Transactions and "
+        st.caption("Division, District, Camp Location and Camp Date are fixed. Fill Number of Transactions and "
                    "Remarks, then click Save entries.")
-        g = editable.set_index("id")[["division", "location", "camp_date", "transactions", "remarks"]].copy()
+        g = editable.set_index("id")[["division", "district", "location", "camp_date", "transactions", "remarks"]].copy()
         g["camp_date"] = pd.to_datetime(g["camp_date"]).dt.strftime("%d-%m-%Y")
         g["transactions"] = pd.to_numeric(g["transactions"], errors="coerce").astype("Int64")
         g["remarks"] = g["remarks"].fillna("")
-        g.columns = ["Division", "Camp Location", "Camp Date", _MBU_TXN, _MBU_REM]
+        g.columns = ["Division", "District", "Camp Location", "Camp Date", _MBU_TXN, _MBU_REM]
         ver = st.session_state.get("mbu_ver", 0)  # new key after a save, so stale edits are not replayed
         edited = st.data_editor(
             g, hide_index=True, use_container_width=True, num_rows="fixed",
-            disabled=["Division", "Camp Location", "Camp Date"],
+            disabled=["Division", "District", "Camp Location", "Camp Date"],
             column_config={_MBU_TXN: st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
                            _MBU_REM: st.column_config.TextColumn(max_chars=300)},
             key=f"mbu_grid_{ver}_{month}_{dv}_{status}")
@@ -2381,8 +2392,8 @@ def mbu_camps_section():
     show = pool.assign(camp_date=pd.to_datetime(pool["camp_date"]).dt.strftime("%d-%m-%Y"),
                        transactions=pool["transactions"].astype("Int64"),
                        remarks=pool["remarks"].fillna("")
-                       )[["division", "location", "camp_date", "transactions", "remarks", "updated_by", "updated_at"]]
-    show = show.rename(columns={"division": "Division", "location": "Camp Location", "camp_date": "Camp Date",
+                       )[["division", "district", "location", "camp_date", "transactions", "remarks", "updated_by", "updated_at"]]
+    show = show.rename(columns={"division": "Division", "district": "District", "location": "Camp Location", "camp_date": "Camp Date",
                                 "transactions": _MBU_TXN, "remarks": _MBU_REM,
                                 "updated_by": "Last updated by", "updated_at": "Last updated at"})
     st.dataframe(show, hide_index=True, use_container_width=True)

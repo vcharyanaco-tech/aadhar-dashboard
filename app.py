@@ -1916,7 +1916,10 @@ def excel_download(df, sheet_name, filename, label, bold_last_row=True):
         df.to_excel(w, index=False, sheet_name=sheet_name)
         ws = w.sheets[sheet_name]
         for i, c in enumerate(df.columns, 1):
-            ws.column_dimensions[_excel_helpers()[1](i)].width = max(len(c), int(df[c].astype(str).str.len().max())) + 3
+            # An empty table (a filter that matches nothing) has no longest value: max() is NaN.
+            longest = df[c].astype(str).str.len().max()
+            longest = 0 if pd.isna(longest) else int(longest)
+            ws.column_dimensions[_excel_helpers()[1](i)].width = max(len(c), longest) + 3
         rows = ws[1] + ws[ws.max_row] if bold_last_row else ws[1]
         for cell in rows:
             cell.font = _excel_helpers()[0](bold=True)
@@ -2096,6 +2099,18 @@ _MBU_HEADERS = {
     "date": ("date", "campdate", "dateofcamp"),
 }
 _MBU_TXN, _MBU_REM = "Number of Transactions", "Remarks"
+# The only remarks allowed when a camp reports 0 transactions.
+_ZERO_REASONS = ["Denied By School Authorities", "Shortage of User", "User on leave"]
+
+
+def _mbu_remark_problem(txn, remark):
+    """Why (transactions, remark) is not allowed, or None. 0 transactions needs one of the
+    fixed reasons; those reasons are not allowed on any other row."""
+    if txn == 0 and remark not in _ZERO_REASONS:
+        return "has 0 transactions, so Remarks must be one of: " + ", ".join(_ZERO_REASONS)
+    if txn != 0 and remark in _ZERO_REASONS:
+        return "has a zero-transaction reason, but its Number of Transactions is not 0"
+    return None
 
 
 def _mbu_col_map(values):
@@ -2286,6 +2301,8 @@ def update_mbu_entries(changes, by):
             row = con.execute("SELECT division FROM mbu_camps WHERE id=?", (cid,)).fetchone()
             if row is None or (not admin and parsers.norm(row["division"]) != mine):
                 continue
+            if _mbu_remark_problem(txn, rem):
+                continue
             con.execute("UPDATE mbu_camps SET transactions=?, remarks=?, updated_by=?, updated_at=? WHERE id=?",
                         (txn, rem, by, now, cid))
             saved += 1
@@ -2296,6 +2313,20 @@ def update_mbu_entries(changes, by):
         audit("mbu_camp.entry", f"{saved} camp row(s) updated")
         kv_sync.request_backup()
     return saved
+
+
+def _months_touched(start, end):
+    """Every 'YYYY-MM' a camp covers: one for a one-day camp, several for a range that crosses a month."""
+    try:
+        y, m = int(start[:4]), int(start[5:7])
+        ey, em = (int(end[:4]), int(end[5:7])) if end else (y, m)
+    except (TypeError, ValueError):
+        return [str(start)[:7]]
+    out = []
+    while (y, m) <= (ey, em) and len(out) < 24:
+        out.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out or [f"{start[:7]}"]
 
 
 def _month_label(m):
@@ -2388,14 +2419,15 @@ def mbu_camps_section():
     df["district"] = df["district"].fillna("")
     df["camp_end_date"] = df["camp_end_date"].fillna("")
     df["_camp_text"] = [_camp_date_text(a, b) for a, b in zip(df["camp_date"], df["camp_end_date"])]
-    df["_month"] = df["camp_date"].str[:7]  # a range is filed under the month it starts in
-    months = sorted(df["_month"].unique(), reverse=True)  # latest month first = the default view
+    # A range that crosses a month boundary is listed under every month it touches.
+    df["_months"] = [_months_touched(a, b or None) for a, b in zip(df["camp_date"], df["camp_end_date"])]
+    months = sorted({x for ms in df["_months"] for x in ms}, reverse=True)  # latest month first = the default view
 
     f1, f2, f3 = st.columns(3)
     month = f1.selectbox("Month", months + ["ALL"], format_func=_month_label, key="mbu_month")
     dv = f2.selectbox("Division", ["All"] + sorted(df["division"].unique()), key="mbu_div")
     status = f3.selectbox("Status", ["All", "Pending (not entered)", "Entered"], key="mbu_status")
-    pool = df if month == "ALL" else df[df["_month"] == month]
+    pool = df if month == "ALL" else df[df["_months"].map(lambda ms: month in ms)]
     if dv != "All":
         pool = pool[pool["division"] == dv]
     if status.startswith("Pending"):
@@ -2427,23 +2459,29 @@ def mbu_camps_section():
         st.info("No camps to fill for the selected filters.")
     else:
         st.caption("Division, District, Camp Location and Camp Date are fixed. Fill Number of Transactions and "
-                   "Remarks, then click Save entries.")
+                   "Remarks, then click Save entries. If Number of Transactions is 0, choose the reason in Remarks "
+                   "(" + ", ".join(_ZERO_REASONS) + "); no other remark is accepted for a 0-transaction camp.")
         g = editable.set_index("id")[["division", "district", "location", "_camp_text", "transactions", "remarks"]].copy()
         g["transactions"] = pd.to_numeric(g["transactions"], errors="coerce").astype("Int64")
-        g["remarks"] = g["remarks"].fillna("")
+        g["remarks"] = g["remarks"].fillna("").astype(str).str.strip()
+        # Free-text remarks saved before this rule are kept in the database but shown blank in the
+        # dropdown (a dropdown cannot show a value that is not one of its options).
+        legacy = {int(i): r for i, r in g["remarks"].items() if r and r not in _ZERO_REASONS}
+        g["remarks"] = g["remarks"].where(g["remarks"].isin(_ZERO_REASONS), None).astype(object)
         g.columns = ["Division", "District", "Camp Location", "Camp Date", _MBU_TXN, _MBU_REM]
         ver = st.session_state.get("mbu_ver", 0)  # new key after a save, so stale edits are not replayed
         edited = st.data_editor(
             g, hide_index=True, use_container_width=True, num_rows="fixed",
             disabled=["Division", "District", "Camp Location", "Camp Date"],
             column_config={_MBU_TXN: st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
-                           _MBU_REM: st.column_config.TextColumn(max_chars=300)},
+                           _MBU_REM: st.column_config.SelectboxColumn(options=_ZERO_REASONS, required=False)},
             key=f"mbu_grid_{ver}_{month}_{dv}_{status}")
 
-        changes, bad = {}, []
+        changes, bad, bad_rem = {}, [], []
         for cid in g.index:
             o_t = None if pd.isna(g.at[cid, _MBU_TXN]) else int(g.at[cid, _MBU_TXN])
-            o_r = str(g.at[cid, _MBU_REM] or "").strip()
+            o_raw = g.at[cid, _MBU_REM]
+            o_r = "" if o_raw is None or pd.isna(o_raw) else str(o_raw).strip()
             raw_t, raw_r = edited.at[cid, _MBU_TXN], edited.at[cid, _MBU_REM]
             n_r = "" if raw_r is None or pd.isna(raw_r) else str(raw_r).strip()
             if raw_t is None or pd.isna(raw_t):
@@ -2454,11 +2492,20 @@ def mbu_camps_section():
             else:
                 n_t = int(raw_t)
             if (o_t, o_r) != (n_t, n_r):
+                if n_r == "" and n_t != 0 and int(cid) in legacy:
+                    n_r = legacy[int(cid)]  # an older free-text remark is not wiped by editing the figure
+                why = _mbu_remark_problem(n_t, n_r)
+                if why:
+                    bad_rem.append(f"{g.at[cid, 'Camp Location']} ({g.at[cid, 'Camp Date']}) {why}")
+                    continue
                 changes[int(cid)] = (n_t, n_r)
         if bad:
             st.error("Number of Transactions must be a whole number, 0 or more: " + "; ".join(bad))
+        if bad_rem:
+            st.error("Remarks not accepted - fix these rows before saving:\n\n- " + "\n- ".join(bad_rem))
         st.caption(f"{len(changes)} row(s) changed." if changes else "No unsaved changes.")
-        if st.button("Save entries", type="primary", disabled=not changes or bool(bad), key="mbu_save"):
+        if st.button("Save entries", type="primary", disabled=not changes or bool(bad) or bool(bad_rem),
+                     key="mbu_save"):
             n = update_mbu_entries(changes, st.session_state["user"]["username"])
             st.session_state["mbu_ver"] = ver + 1
             flash(f"{n} MBU camp entr{'y' if n == 1 else 'ies'} saved.")

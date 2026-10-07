@@ -209,7 +209,7 @@ def init_db():
     con = connect()
     try:
         parsers.ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0", "division": "TEXT"})
-        parsers.ensure_cols(con, "mbu_camps", {"district": "TEXT"})  # added after the first MBU release
+        parsers.ensure_cols(con, "mbu_camps", {"district": "TEXT", "camp_end_date": "TEXT"})  # both added after the first MBU release
         # The report queries filter on tx.upload_id and join on tx.key; without
         # these every page load is a full scan of a table that grows daily.
         parsers.ensure_indexes(con)
@@ -1826,12 +1826,22 @@ def report_tab():
     st.caption("Station IDs with no transactions in the selected period(s). 'No data in period' means the "
                "station is in the master sheet but never appeared in the uploaded files; 'No transactions in "
                "period' means it appeared but with zero transactions. Independent of the Division filter above.")
-    nw_cols = ["division", "sub_division", "station", "office_id"]
+    nw_cols = ["key", "division", "sub_division", "station", "office_id"]
     nw = pd.concat([
         agg_full[agg_full["total"] <= 0][nw_cols].assign(Status="No transactions in period"),
         missing[nw_cols].assign(Status="No data in period"),
     ], ignore_index=True)
     nw["sub_division"] = nw["sub_division"].fillna("Not mapped").replace("", "Not mapped")
+    # Machine address: the one seen in the daily sheets of the selected period; a station
+    # with no data at all has none there, so fall back to the address held in the master.
+    mach = machine_address_map(tuple(ids))
+    try:
+        _ma = read_sql("SELECT key, address FROM master")
+        master_addr = dict(zip(_ma["key"], _ma["address"].fillna("")))
+    except Exception:
+        master_addr = {}
+    nw["Machine Address"] = nw["key"].map(lambda k: mach.get(k) or master_addr.get(k) or "")
+    nw = nw.drop(columns="key")
     nw = nw.rename(columns={"division": "Division", "sub_division": "Sub Division",
                             "station": "Station", "office_id": "Office ID"})
     nw = nw.sort_values(["Division", "Sub Division", "Station"])
@@ -1842,7 +1852,7 @@ def report_tab():
         for div_name, g in nw.groupby("Division"):
             total_ids = int(totals.get(div_name, len(g)))
             with st.expander(f"{div_name} - {len(g)} not working out of {total_ids} station IDs"):
-                st.dataframe(g[["Sub Division", "Station", "Office ID", "Status"]],
+                st.dataframe(g[["Sub Division", "Station", "Office ID", "Machine Address", "Status"]],
                              hide_index=True, use_container_width=True)
         st.download_button("Download Not Working Stations CSV", nw.to_csv(index=False).encode("utf-8-sig"),
                            "haryana_circle_not_working_stations.csv", "text/csv", key="dl_not_working")
@@ -2111,6 +2121,65 @@ def _parse_camp_date(v):
     return None if pd.isna(d) else d.date()
 
 
+_DATE_TOKEN = re.compile(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}")
+_RANGE_SPLIT = re.compile(r"\s+(?:to|till|upto|up to|se)\s+|\s*[\u2013\u2014~]\s*|\s+-\s+", re.I)
+
+
+def _parse_camp_range(v):
+    """Camp Date cell -> (start, end, error). `end` is None for a one-day camp.
+
+    Accepts a single date, or a range such as '15-11-2026 to 17-11-2026',
+    '15/11/2026 - 17/11/2026', '15 to 17-11-2026' (month and year taken from the end date).
+    `start` is None when the cell cannot be read.
+    """
+    if not isinstance(v, str):
+        d = _parse_camp_date(v)
+        return d, None, None
+    s = v.strip()
+    if not s:
+        return None, None, None
+    toks = _DATE_TOKEN.findall(s)
+    if len(toks) == 2:
+        parts = toks
+    else:
+        d = _parse_camp_date(s)
+        if d:
+            return d, None, None
+        parts = [x for x in _RANGE_SPLIT.split(s) if x and x.strip()]
+        if len(parts) != 2:
+            return None, None, None
+    a, b = (x.strip() for x in parts)
+    end = _parse_camp_date(b)
+    if end is None:
+        return None, None, None
+    if re.fullmatch(r"\d{1,2}", a):
+        try:
+            start = end.replace(day=int(a))
+        except ValueError:
+            return None, None, None
+    else:
+        start = _parse_camp_date(a)
+    if start is None:
+        return None, None, None
+    if end < start:
+        return None, None, "has an end date earlier than the start date."
+    if end == start:
+        return start, None, None
+    return start, end, None
+
+
+def _camp_date_text(start, end):
+    """'dd-mm-yyyy' for a one-day camp, 'dd-mm-yyyy to dd-mm-yyyy' for a range."""
+    def fmt(x):
+        try:
+            return datetime.strptime(str(x)[:10], "%Y-%m-%d").strftime("%d-%m-%Y")
+        except ValueError:
+            return str(x)
+    if end is None or str(end).strip() in ("", "None", "nan"):
+        return fmt(start)
+    return f"{fmt(start)} to {fmt(end)}"
+
+
 def parse_mbu_sheet(f, master_divisions):
     """Read an uploaded MBU camp sheet. Returns (rows, problems, dup_in_file).
 
@@ -2143,22 +2212,25 @@ def parse_mbu_sheet(f, master_divisions):
         district = "" if dist_raw is None or pd.isna(dist_raw) else re.sub(r"\s+", " ", str(dist_raw)).strip()
         dv_txt = "" if pd.isna(dv_raw) else str(dv_raw).strip()
         loc = "" if pd.isna(loc_raw) else re.sub(r"\s+", " ", str(loc_raw)).strip()
-        d = _parse_camp_date(dt_raw)
+        d, d_end, d_err = _parse_camp_range(dt_raw)
         div = canon.get(parsers.norm(dv_txt))
         if not dv_txt or div is None:
             problems.append(f"Row {n}: Division '{dv_txt}' is not in the master sheet.")
         if not loc:
             problems.append(f"Row {n}: Camp Location is empty.")
         if d is None:
-            problems.append(f"Row {n}: Camp Date '{dt_raw}' is not a valid date.")
+            problems.append(f"Row {n}: Camp Date '{dt_raw}' " + (d_err or "is not a valid date or date range."))
         if not (div and loc and d):
             continue
-        key = f"{d.isoformat()}|{_nk(div)}|{_nk(loc)}"
+        # One-day camps keep the old key format, so camps loaded earlier still match on re-upload.
+        key = (f"{d.isoformat()}|{_nk(div)}|{_nk(loc)}" if d_end is None
+               else f"{d.isoformat()}~{d_end.isoformat()}|{_nk(div)}|{_nk(loc)}")
         if key in seen:
             dup += 1
             continue
         seen.add(key)
-        rows.append({"division": div, "district": district, "location": loc, "date": d.isoformat(), "key": key})
+        rows.append({"division": div, "district": district, "location": loc, "date": d.isoformat(),
+                     "end_date": d_end.isoformat() if d_end else "", "key": key})
     if not rows and not problems:
         problems.append("No camp rows found below the header.")
     return rows, problems, dup
@@ -2174,9 +2246,10 @@ def save_mbu_batch(rows, filename, by):
         batch_id, added = cur.lastrowid, 0
         for r in rows:
             c = con.execute(
-                "INSERT OR IGNORE INTO mbu_camps(batch_id, camp_date, division, district, location, dedupe_key,"
-                " created_by, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (batch_id, r["date"], r["division"], r["district"], r["location"], r["key"], by, now))
+                "INSERT OR IGNORE INTO mbu_camps(batch_id, camp_date, camp_end_date, division, district, location,"
+                " dedupe_key, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (batch_id, r["date"], r.get("end_date") or None, r["division"], r["district"], r["location"],
+                 r["key"], by, now))
             added += c.rowcount
             if c.rowcount == 0 and r["district"]:
                 # Camp already exists: only fill a blank district (e.g. camps loaded before
@@ -2238,12 +2311,14 @@ def mbu_upload_panel():
     if not is_admin():  # server-side guard
         return
     with st.expander("Upload MBU camp sheet (admin)"):
-        st.caption("Columns: Division, District, Camp Location, Camp Date. Upload one sheet per month. Camps already "
+        st.caption("Columns: Division, District, Camp Location, Camp Date. Camp Date can be one date or a date range "
+                   "(e.g. 15-11-2026 to 17-11-2026). Upload one sheet per month. Camps already "
                    "present (same date + division + location) are left untouched, so entries already made "
                    "are never lost; only new camps are added. Division names must match the master sheet. "
                    "If a date or location was wrong in an earlier upload, delete that row below and upload again.")
         st.download_button("Download sample format (CSV)",
                            "Division,District,Camp Location,Camp Date\nSample Division,Sample District,Sample Post Office,15-11-2026\n"
+                           "Sample Division,Sample District,Sample Post Office 2,18-11-2026 to 20-11-2026\n"
                            .encode("utf-8-sig"), "mbu_camps_sample.csv", "text/csv", key="mbu_sample_dl")
         if not get_divisions():
             st.info("Upload the master sheet first, so division names can be checked.")
@@ -2303,14 +2378,17 @@ def mbu_upload_panel():
 
 def mbu_camps_section():
     mbu_upload_panel()
-    df = read_sql("SELECT id, camp_date, division, district, location, transactions, remarks, updated_by, updated_at"
+    df = read_sql("SELECT id, camp_date, camp_end_date, division, district, location, transactions, remarks,"
+                  " updated_by, updated_at"
                   " FROM mbu_camps ORDER BY camp_date, division, location")
     if df.empty:
         st.info("No MBU camp sheet has been uploaded yet." + (" Please contact the admin." if not is_admin() else ""))
         return
     df["transactions"] = pd.to_numeric(df["transactions"], errors="coerce")  # all-NULL column arrives as object
     df["district"] = df["district"].fillna("")
-    df["_month"] = df["camp_date"].str[:7]
+    df["camp_end_date"] = df["camp_end_date"].fillna("")
+    df["_camp_text"] = [_camp_date_text(a, b) for a, b in zip(df["camp_date"], df["camp_end_date"])]
+    df["_month"] = df["camp_date"].str[:7]  # a range is filed under the month it starts in
     months = sorted(df["_month"].unique(), reverse=True)  # latest month first = the default view
 
     f1, f2, f3 = st.columns(3)
@@ -2350,8 +2428,7 @@ def mbu_camps_section():
     else:
         st.caption("Division, District, Camp Location and Camp Date are fixed. Fill Number of Transactions and "
                    "Remarks, then click Save entries.")
-        g = editable.set_index("id")[["division", "district", "location", "camp_date", "transactions", "remarks"]].copy()
-        g["camp_date"] = pd.to_datetime(g["camp_date"]).dt.strftime("%d-%m-%Y")
+        g = editable.set_index("id")[["division", "district", "location", "_camp_text", "transactions", "remarks"]].copy()
         g["transactions"] = pd.to_numeric(g["transactions"], errors="coerce").astype("Int64")
         g["remarks"] = g["remarks"].fillna("")
         g.columns = ["Division", "District", "Camp Location", "Camp Date", _MBU_TXN, _MBU_REM]
@@ -2389,7 +2466,7 @@ def mbu_camps_section():
     # ---- read-only report for everyone
     st.divider()
     st.subheader("MBU camp report")
-    show = pool.assign(camp_date=pd.to_datetime(pool["camp_date"]).dt.strftime("%d-%m-%Y"),
+    show = pool.assign(camp_date=pool["_camp_text"],
                        transactions=pool["transactions"].astype("Int64"),
                        remarks=pool["remarks"].fillna("")
                        )[["division", "district", "location", "camp_date", "transactions", "remarks", "updated_by", "updated_at"]]
@@ -2423,7 +2500,7 @@ def mbu_camps_section():
 
     if is_admin() and len(pool):
         with st.expander("Delete a single MBU camp row (admin)"):
-            opts = {f"{r['camp_date']} - {r['location']} ({r['division']}) #{r['id']}": r["id"]
+            opts = {f"{r['_camp_text']} - {r['location']} ({r['division']}) #{r['id']}": r["id"]
                     for _, r in pool.iterrows()}
             pick = st.selectbox("Select camp", list(opts), key="mbu_del_row_pick")
             ok = st.checkbox("I confirm: delete this camp row", key=f"mbu_del_row_ok_{opts[pick]}")

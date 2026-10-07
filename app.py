@@ -451,7 +451,14 @@ def select_period_ids(uploads, key_prefix):
     if mode == "Date range" and dated_ids:
         all_dates = [upload_date[i] for i in dated_ids]
         lo, hi = min(all_dates), max(all_dates)
-        rng = st.date_input("Date range (from - to)", value=(lo, hi), min_value=lo, max_value=hi,
+        # Default view = current month, from its 1st up to the latest upload.
+        # Earlier months stay selectable (min_value=lo). If nothing has been
+        # uploaded yet for the current month, fall back to the month of the
+        # latest upload so the default range is never empty or out of bounds.
+        default_start = max(lo, date.today().replace(day=1))
+        if default_start > hi:
+            default_start = max(lo, hi.replace(day=1))
+        rng = st.date_input("Date range (from - to)", value=(default_start, hi), min_value=lo, max_value=hi,
                             format="DD-MM-YYYY", key=f"{key_prefix}_range")
         if isinstance(rng, tuple) and len(rng) < 2:
             st.info("Select the end date to complete the range.")

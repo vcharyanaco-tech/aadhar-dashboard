@@ -1097,6 +1097,71 @@ def sidebar(page_names):
     return page
 
 
+def last7_division_totals(uploads, dv="All", ds="All"):
+    """Total transactions per day per Division for the 7 calendar days ending at
+    the latest uploaded date. Each day is built from its own upload(s) through
+    build_period_adj, so station ID changes and Division transfers are applied
+    exactly as in the rest of the dashboard.
+
+    Returns (rows_df, day_labels). A day with no upload (e.g. a Sunday) has no
+    rows but stays in day_labels so the gap is visible on the chart.
+    """
+    dated = {}
+    for r in uploads:
+        d = parse_label_date(r["label"])
+        if d is not None:
+            dated.setdefault(d, []).append(r["id"])
+    if not dated:
+        return pd.DataFrame(columns=["Day", "Division", "Transactions"]), []
+    end = max(dated)
+    days = [end - timedelta(days=i) for i in range(6, -1, -1)]
+    labels = [d.strftime("%d-%b (%a)") for d in days]
+    rows = []
+    for d, lab in zip(days, labels):
+        ids_d = dated.get(d)
+        if not ids_d:
+            continue
+        a, _, _, _ = build_period_adj(tuple(ids_d))
+        if dv != "All":
+            a = a[a["division"] == dv]
+        if ds != "All":
+            a = a[a["sub_division"] == ds]
+        for division, total in a.groupby("division")["total"].sum().items():
+            rows.append({"Day": lab, "Division": division, "Transactions": int(total)})
+    return pd.DataFrame(rows, columns=["Day", "Division", "Transactions"]), labels
+
+
+def last7_chart(uploads, dv="All", ds="All"):
+    st.subheader("Last 7 days - total transactions (Division-wise)")
+    data, labels = last7_division_totals(uploads, dv, ds)
+    if data.empty:
+        st.info("No dated uploads available for the last 7 days.")
+        return
+    st.caption(f"7 days ending {labels[-1].split(' ')[0]} (latest uploaded date). Each colour is a Division; "
+               "the number on top is the day's total. A day with no upload (e.g. Sunday) is left empty. "
+               "Follows the Division / Sub Division filters above.")
+    fig = _plotly().bar(data, x="Day", y="Transactions", color="Division", barmode="stack",
+                        category_orders={"Day": labels},
+                        title="Last 7 days - total transactions by Division")
+    totals = data.groupby("Day")["Transactions"].sum().reindex(labels).dropna()
+    fig.add_scatter(x=list(totals.index), y=list(totals.values), mode="text",
+                    text=[f"{int(t):,}" for t in totals.values], textposition="top center",
+                    showlegend=False, hoverinfo="skip")
+    fig.update_layout(xaxis_title="", legend_title_text="Division")
+    st.plotly_chart(fig, use_container_width=True)
+
+    pivot = (data.pivot_table(index="Division", columns="Day", values="Transactions", aggfunc="sum", fill_value=0)
+             .reindex(columns=[l for l in labels if l in set(data["Day"])]))
+    pivot["Total"] = pivot.sum(axis=1)
+    pivot = pivot.sort_values("Total", ascending=False)
+    pivot.loc["Grand Total"] = pivot.sum()
+    pivot = pivot.reset_index()
+    with st.expander("Day-wise table"):
+        st.dataframe(pivot, hide_index=True, use_container_width=True)
+        st.download_button("Download last 7 days CSV", pivot.to_csv(index=False).encode("utf-8-sig"),
+                           "last7_days_division_transactions.csv", "text/csv", key="dl_last7")
+
+
 def dashboard():
     uploads = run("SELECT * FROM uploads ORDER BY id DESC", many=True)
     if not table_exists("master") or not uploads:
@@ -1195,11 +1260,7 @@ def dashboard():
         st.info("No division in the current view has a configured daily target.")
 
     st.divider()
-    d = show.groupby("Division")[["New enrolment", "Updates"]].sum().reset_index()
-    fig_d = _plotly().bar(d.melt("Division", var_name="Type", value_name="Count"), x="Division", y="Count",
-                   color="Type", barmode="stack", text="Count", title="Division-wise transactions")
-    fig_d.update_traces(texttemplate="%{text:,.0f}", textposition="inside")
-    st.plotly_chart(fig_d, use_container_width=True)
+    last7_chart(uploads, dv, ds)
 
     if len(miss):
         with st.expander(f"{len(miss)} master stations have no transaction data"):

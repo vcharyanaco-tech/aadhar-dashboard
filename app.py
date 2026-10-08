@@ -1360,6 +1360,85 @@ def operator_analysis_tab():
         excel_download(show, "Operator Analysis", "operator_analysis.xlsx", "Download Excel",
                        bold_last_row=False)
 
+    low_txn_operator_reports(ids, ops, dv)
+
+
+def low_txn_operator_rows(upload_rows):
+    """Per upload (day), per operator and station: total transactions, with address.
+
+    Reads tx directly because build_period only keeps one row per operator.
+    The operator and total columns are found by name, since their stored names
+    depend on parsers.save_tx. Returns (DataFrame, error_message_or_None).
+    """
+    cols = {r["name"].lower(): r["name"] for r in run("PRAGMA table_info(tx)", many=True)}
+    op_col = next((cols[c] for c in ("operator", "operator_id", "session_operator_id") if c in cols), None)
+    tot_col = next((cols[c] for c in ("total", "count_u_plus_n_plus_z", "count_u_n_z", "txn", "transactions")
+                    if c in cols), None)
+    if tot_col is None:
+        tot_col = next((o for l, o in cols.items() if "u_plus_n_plus_z" in l), None)
+    if not op_col or not tot_col:
+        return pd.DataFrame(), ("Operator or total-transactions column not found in the stored transaction "
+                                f"data (columns: {', '.join(cols.values())}). Send parsers.py to adapt this report.")
+    addr_sql = f', MAX("{cols["address"]}") AS address' if "address" in cols else ", '' AS address"
+    frames = []
+    for r in upload_rows:
+        sql = (f'SELECT key, TRIM("{op_col}") AS operator, SUM("{tot_col}") AS total{addr_sql} '
+               f'FROM tx WHERE upload_id=? AND "{op_col}" IS NOT NULL AND TRIM("{op_col}") <> \'\' '
+               f'GROUP BY key, TRIM("{op_col}")')
+        d = read_sql(sql, (r["id"],))
+        d["Date"] = r["label"]
+        frames.append(d)
+    if not frames:
+        return pd.DataFrame(), None
+    out = pd.concat(frames, ignore_index=True)
+    out["total"] = pd.to_numeric(out["total"], errors="coerce").fillna(0).astype(int)
+    return out, None
+
+
+def low_txn_operator_reports(ids, ops, dv):
+    st.divider()
+    st.subheader("Date-wise low transaction reports")
+    st.caption("Per day, operator and station ID with the machine address. Report 1: fewer than 10 "
+               "transactions. Report 2: 10 to 20 transactions (both included).")
+    marks = ",".join("?" * len(ids))
+    ups = sort_uploads_by_date_desc(run(f"SELECT * FROM uploads WHERE id IN ({marks})", tuple(ids), many=True))
+    rows, err = low_txn_operator_rows(ups)
+    if err:
+        st.warning(err)
+        return
+    if rows.empty:
+        st.info("No operator-wise rows in the selected period.")
+        return
+    m = read_sql("SELECT key, station, division, sub_division FROM master")
+    names = dict(zip(ops["operator"], ops["operator_name"]))
+    df = rows.merge(m, on="key", how="left")
+    df["division"] = df["division"].fillna("Not in master")
+    df["sub_division"] = df["sub_division"].fillna("")
+    df["station"] = df["station"].fillna(df["key"])
+    df["Operator Name"] = df["operator"].map(names).fillna("")
+    if dv != "All":
+        df = df[df["division"] == dv]
+    df = df.rename(columns={"operator": "Operator ID", "station": "Station ID", "address": "Machine Address",
+                            "division": "Division", "sub_division": "Sub Division", "total": "Transactions"})
+    cols = ["Date", "Operator ID", "Operator Name", "Station ID", "Machine Address", "Division",
+            "Sub Division", "Transactions"]
+    order = {r["label"]: i for i, r in enumerate(ups)}
+    df["_o"] = df["Date"].map(order)
+    df = df.sort_values(["_o", "Division", "Transactions"])[cols]
+    t1, t2 = st.tabs(["Less than 10", "10 to 20"])
+    for tab, sub, name, key in ((t1, df[df["Transactions"] < 10], "less_than_10", "lt10"),
+                                (t2, df[(df["Transactions"] >= 10) & (df["Transactions"] <= 20)],
+                                 "10_to_20", "b1020")):
+        with tab:
+            st.caption(f"{len(sub):,} operator-station row(s) across {sub['Date'].nunique()} day(s).")
+            st.dataframe(sub, hide_index=True, use_container_width=True)
+            c1, c2 = st.columns(2)
+            c1.download_button("Download CSV", sub.to_csv(index=False).encode("utf-8-sig"),
+                               f"operators_txn_{name}.csv", "text/csv", key=f"opan_{key}_csv")
+            with c2:
+                excel_download(sub, name[:31], f"operators_txn_{name}.xlsx", "Download Excel",
+                               bold_last_row=False)
+
 
 def upload_tab():
     if not is_admin():  # server-side guard
@@ -1391,7 +1470,6 @@ def upload_tab():
                     mm = read_file(f, parse_master)
                     replace_master(mm, confirm_orphans=force_master)
                     st.session_state.pop("master_orphan_warning", None)
-                    st.session_state["force_master_replace"] = False
                     flash(f"Master saved: {len(mm)} stations.")
                 except ValueError as e:
                     # Distinguish "this file is unparseable" from "this file would
@@ -1399,7 +1477,6 @@ def upload_tab():
                     msg = str(e)
                     if "no master entry" in msg:
                         st.session_state["master_orphan_warning"] = msg
-                        st.session_state["force_master_replace"] = False
                         st.rerun()
                     st.error(msg)
                 except Exception as e:

@@ -1372,17 +1372,15 @@ def low_txn_operator_rows(upload_rows):
     """
     cols = {r["name"].lower(): r["name"] for r in run("PRAGMA table_info(tx)", many=True)}
     op_col = next((cols[c] for c in ("operator", "operator_id", "session_operator_id") if c in cols), None)
-    tot_col = next((cols[c] for c in ("total", "count_u_plus_n_plus_z", "count_u_n_z", "txn", "transactions")
-                    if c in cols), None)
-    if tot_col is None:
-        tot_col = next((o for l, o in cols.items() if "u_plus_n_plus_z" in l), None)
-    if not op_col or not tot_col:
-        return pd.DataFrame(), ("Operator or total-transactions column not found in the stored transaction "
-                                f"data (columns: {', '.join(cols.values())}). Send parsers.py to adapt this report.")
+    # tx has no total column: Total = New Enrolment + Updates (enr + upd).
+    if not op_col or "enr" not in cols or "upd" not in cols:
+        return pd.DataFrame(), ("Operator, enr or upd column not found in the stored transaction "
+                                f"data (columns: {', '.join(cols.values())}).")
+    tot_expr = f'SUM(COALESCE("{cols["enr"]}",0) + COALESCE("{cols["upd"]}",0))'
     addr_sql = f', MAX("{cols["address"]}") AS address' if "address" in cols else ", '' AS address"
     frames = []
     for r in upload_rows:
-        sql = (f'SELECT key, TRIM("{op_col}") AS operator, SUM("{tot_col}") AS total{addr_sql} '
+        sql = (f'SELECT key, TRIM("{op_col}") AS operator, {tot_expr} AS total{addr_sql} '
                f'FROM tx WHERE upload_id=? AND "{op_col}" IS NOT NULL AND TRIM("{op_col}") <> \'\' '
                f'GROUP BY key, TRIM("{op_col}")')
         d = read_sql(sql, (r["id"],))

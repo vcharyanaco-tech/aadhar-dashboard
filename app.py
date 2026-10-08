@@ -1410,6 +1410,8 @@ def low_txn_operator_reports(ids, ops, dv):
     m = read_sql("SELECT key, station, division, sub_division FROM master")
     names = dict(zip(ops["operator"], ops["operator_name"]))
     df = rows.merge(m, on="key", how="left")
+    # Machine address from the master (daily-sheet address only if master has none).
+    df["address"] = df["key"].map(machine_address_map(tuple(ids))).fillna("")
     df["division"] = df["division"].fillna("Not in master")
     df["sub_division"] = df["sub_division"].fillna("")
     df["station"] = df["station"].fillna(df["key"])
@@ -1778,21 +1780,34 @@ def build_period(ids):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def machine_address_map(ids):
-    """key -> machine address(es) seen in the daily sheets of the selected uploads.
+    """key -> machine address, taken from the MASTER sheet.
 
-    A station can have several machines at different addresses, so distinct
-    addresses are joined with " | ". Returns {} if the tx table has no address.
+    The master is the single source of truth for a station's machine address, so
+    every report (Dashboard, Report, Operator Analysis) shows the same value. The
+    address seen in the daily sheets of the selected uploads is used ONLY for a
+    key that has no address in the master (blank, or the station is not in the
+    master at all), so such rows are not left empty.
     """
+    daily = {}
     try:
         marks = ",".join("?" * len(ids))
         df = read_sql(f"SELECT DISTINCT key, address FROM tx WHERE upload_id IN ({marks})"
                       " AND address IS NOT NULL AND TRIM(address) <> ''", tuple(ids))
-        if df.empty:
-            return {}
-        df["address"] = df["address"].astype(str).str.strip()
-        return df.groupby("key")["address"].agg(lambda s: " | ".join(sorted(set(s)))).to_dict()
+        if not df.empty:
+            df["address"] = df["address"].astype(str).str.strip()
+            daily = df.groupby("key")["address"].agg(lambda s: " | ".join(sorted(set(s)))).to_dict()
     except Exception:
-        return {}
+        daily = {}
+    master = {}
+    try:
+        mm = read_sql("SELECT key, address FROM master")
+        for k, a in zip(mm["key"], mm["address"]):
+            if pd.notna(a) and str(a).strip():
+                master[k] = str(a).strip()
+    except Exception:
+        master = {}
+    daily.update(master)  # master wins wherever it has an address
+    return daily
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -1975,15 +1990,9 @@ def report_tab():
         missing[nw_cols].assign(Status="No data in period"),
     ], ignore_index=True)
     nw["sub_division"] = nw["sub_division"].fillna("Not mapped").replace("", "Not mapped")
-    # Machine address: the one seen in the daily sheets of the selected period; a station
-    # with no data at all has none there, so fall back to the address held in the master.
+    # Machine address comes from the master (see machine_address_map).
     mach = machine_address_map(tuple(ids))
-    try:
-        _ma = read_sql("SELECT key, address FROM master")
-        master_addr = dict(zip(_ma["key"], _ma["address"].fillna("")))
-    except Exception:
-        master_addr = {}
-    nw["Machine Address"] = nw["key"].map(lambda k: mach.get(k) or master_addr.get(k) or "")
+    nw["Machine Address"] = nw["key"].map(lambda k: mach.get(k, ""))
     nw = nw.drop(columns="key")
     nw = nw.rename(columns={"division": "Division", "sub_division": "Sub Division",
                             "station": "Station", "office_id": "Office ID"})

@@ -1186,11 +1186,11 @@ def dashboard():
     pool = agg if dv == "All" else agg[agg["division"] == dv]
     ds = f2.selectbox("Sub Division", ["All"] + sorted(d for d in pool["sub_division"].unique() if d),
                       key="dash_sub_division")
-    q = f3.text_input("Search station, office ID or address (office / machine)").strip().lower()
+    q = f3.text_input("Search station, office ID or machine address").strip().lower()
 
     v = pool if ds == "All" else pool[pool["sub_division"] == ds]
     if q:
-        blob = (v["station"] + " " + v["office_id"] + " " + v["address"] + " " + v["machine_address"]).str.lower()
+        blob = (v["station"] + " " + v["office_id"] + " " + v["machine_address"]).str.lower()
         v = v[blob.str.contains(q, regex=False)]
     miss = missing if dv == "All" else missing[missing["division"] == dv]
 
@@ -1203,10 +1203,10 @@ def dashboard():
 
     show = v.rename(columns={"station": "Station", "office_id": "Office ID", "division": "Division",
                              "sub_division": "Sub Division", "district": "District",
-                             "address": "Office address", "operator_name": "Operator Name",
+                             "machine_address": "Machine Address", "operator_name": "Operator Name",
                              "enr": "New enrolment", "mbu": "MBU", "demo": "Demographic updates",
                              "nonmbu": "Non-MBU", "upd": "Updates", "total": "Total"})
-    cols = ["Station", "Office ID", "Operator Name", "Division", "Sub Division", "District", "Office address",
+    cols = ["Station", "Office ID", "Operator Name", "Division", "Sub Division", "District", "Machine Address",
             "New enrolment", "MBU", "Demographic updates", "Non-MBU", "Updates", "Total"]
     show = show[cols].sort_values("Total", ascending=False)
 

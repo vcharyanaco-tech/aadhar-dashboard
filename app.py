@@ -209,6 +209,7 @@ def init_db():
     con = connect()
     try:
         parsers.ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0", "division": "TEXT"})
+        parsers.ensure_cols(con, "station_transfers", {"old_address": "TEXT", "new_address": "TEXT"})
         parsers.ensure_cols(con, "mbu_camps", {"district": "TEXT", "camp_end_date": "TEXT"})  # both added after the first MBU release
         # The report queries filter on tx.upload_id and join on tx.key; without
         # these every page load is a full scan of a table that grows daily.
@@ -603,7 +604,8 @@ def apply_station_changes(agg, missing, period_dates, changes):
     start, end = min(period_dates), max(period_dates)
     eff = pd.to_datetime(changes["effective_date"], errors="coerce").dt.date
     old_gone = set(changes.loc[eff.notna() & (eff <= start), "old_key"])
-    new_pending = set(changes.loc[eff.notna() & (eff > end), "new_key"])
+    new_pending = {k for k in changes.loc[eff.notna() & (eff > end), "new_key"]
+                   if isinstance(k, str) and k.strip()}
     inactive = old_gone | new_pending
     if inactive:
         missing = missing[~missing["key"].isin(inactive)]
@@ -645,7 +647,7 @@ def carry_over_station_changes(m):
         rows = []
         for _, r in ch.iterrows():
             for k, name in ((r["old_key"], r["old_station"]), (r["new_key"], r["new_station"])):
-                if str(k) in have:
+                if k is None or not str(k).strip() or str(k) in have:
                     continue
                 have.add(str(k))
                 rows.append({"key": k, "station": name, "office_id": r["office_id"],
@@ -662,49 +664,35 @@ def carry_over_station_changes(m):
         return m, 0
 
 
-def register_station_change(old_key, new_id, effective, by):
-    """Retire `old_key` from `effective` and add `new_id` to master. Returns (ok, message)."""
-    new_id = str(new_id).strip()
-    if not new_id:
-        return False, "Enter the new station ID."
+def register_station_change(old_key, effective, by):
+    """Retire `old_key` from `effective`. No new station ID is added. Returns (ok, message).
+
+    The old ID stays in master so history keeps its division; from the effective
+    date onward it is no longer counted as a station. Reports for dates before the
+    effective date are unaffected. The row keeps new_key / new_station blank (older
+    rows made with a replacement ID still carry theirs and keep working).
+    """
     con = connect()
     try:
         old = con.execute("SELECT * FROM master WHERE key=?", (old_key,)).fetchone()
         if old is None:
             return False, "The selected station is no longer in the master."
         old = dict(old)
-        try:
-            new_key = norm_key(new_id)
-            rule_ok = norm_key(old["station"]) == old["key"]
-        except Exception:
-            return False, "Could not work out the key for this station ID."
-        if not rule_ok:
-            return False, ("The master's keys are not built from the station ID alone, so a new key "
-                           "cannot be derived safely. Send parsers.py so this can be adapted.")
-        if not new_key or new_key == old_key:
-            return False, "The new station ID must be different from the old one."
-        if con.execute("SELECT 1 FROM master WHERE key=?", (new_key,)).fetchone():
-            return False, "This station ID already exists in the master."
-        row = dict(old)
-        row["key"], row["station"] = new_key, new_id
-        cols = list(row)
-        con.execute("INSERT INTO master(" + ",".join(f'"{c}"' for c in cols) + ") VALUES ("
-                    + ",".join("?" * len(cols)) + ")", [row[c] for c in cols])
         con.execute(
             "INSERT INTO station_changes(old_key, old_station, new_key, new_station, office_id, division,"
             " sub_division, address, district, effective_date, changed_by, changed_at)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (old_key, old.get("station"), new_key, new_id, old.get("office_id"), old.get("division"),
+            (old_key, old.get("station"), "", "", old.get("office_id"), old.get("division"),
              old.get("sub_division"), old.get("address"), old.get("district"),
              effective.strftime("%Y-%m-%d"), by, datetime.now().strftime("%Y-%m-%d %H:%M")))
         con.commit()
     finally:
         con.close()
     clear_report_cache()
-    audit("station.change", f"{old.get('station')} -> {new_id} ({old.get('division')}/"
-                            f"{old.get('sub_division')}) effective {effective.strftime('%d-%m-%Y')}")
+    audit("station.retire", f"{old.get('station')} ({old.get('division')}/"
+                            f"{old.get('sub_division')}) retired effective {effective.strftime('%d-%m-%Y')}")
     kv_sync.request_backup()
-    return True, (f"Station ID changed: {old.get('station')} -> {new_id}, effective "
+    return True, (f"Station ID {old.get('station')} retired, effective "
                   f"{effective.strftime('%d-%m-%Y')}.")
 
 
@@ -713,17 +701,19 @@ def undo_station_change(change_id):
     row = run("SELECT * FROM station_changes WHERE id=?", (change_id,), one=True)
     if row is None:
         return False, "That change no longer exists."
-    try:
-        used = run("SELECT 1 FROM tx WHERE key=? LIMIT 1", (row["new_key"],), one=True)
-    except Exception:
-        return False, "Could not check whether the new ID already has data, so nothing was changed."
-    if used:
-        return False, ("The new station ID already has transaction data, so this change cannot be "
-                       "undone. Add another Station ID change instead.")
-    run("DELETE FROM master WHERE key=?", (row["new_key"],))
+    new_key = (row["new_key"] or "").strip()
+    if new_key:  # older change that also added a replacement ID
+        try:
+            used = run("SELECT 1 FROM tx WHERE key=? LIMIT 1", (new_key,), one=True)
+        except Exception:
+            return False, "Could not check whether the new ID already has data, so nothing was changed."
+        if used:
+            return False, ("The new station ID already has transaction data, so this change cannot be "
+                           "undone. Add another Station ID change instead.")
+        run("DELETE FROM master WHERE key=?", (new_key,))
     run("DELETE FROM station_changes WHERE id=?", (change_id,))
     clear_report_cache()
-    audit("station.change_undo", f"{row['old_station']} -> {row['new_station']}")
+    audit("station.change_undo", f"{row['old_station']} -> {row['new_station'] or '(retired only)'}")
     kv_sync.request_backup()
     return True, "Station ID change undone."
 
@@ -775,48 +765,71 @@ def reapply_station_transfers(m):
             if (m.at[i, "division"], m.at[i, "sub_division"]) != (r["new_division"], r["new_sub_division"]):
                 m.at[i, "division"], m.at[i, "sub_division"] = r["new_division"], r["new_sub_division"]
                 moved += 1
+            # Keep the address entered at transfer time, but only while the uploaded
+            # sheet still carries the old (or no) address; a newer address in the
+            # sheet is not overwritten.
+            new_addr = r.get("new_address") if hasattr(r, "get") else None
+            if "address" in m.columns and isinstance(new_addr, str) and new_addr.strip():
+                cur = str(m.at[i, "address"] if pd.notna(m.at[i, "address"]) else "").strip()
+                old_addr = str(r.get("old_address")).strip() if pd.notna(r.get("old_address")) else ""
+                if cur in ("", old_addr) and cur != new_addr.strip():
+                    m.at[i, "address"] = new_addr.strip()
         return m, moved
     except Exception:
         return m, 0
 
 
-def register_station_transfer(key, new_div, new_sub, effective, by):
-    """Move one station to another Division / Sub Division. Returns (ok, message)."""
+def register_station_transfer(key, new_div, new_sub, effective, by, new_address=None):
+    """Move one station to another Division / Sub Division. Returns (ok, message).
+
+    `new_address` optionally updates the machine address (master.address) from the
+    same effective date. Blank means "leave the address as it is". The old address
+    is kept on the transfer row so reports for earlier dates still show it.
+    """
     if not new_div or not new_sub:
         return False, "Select the new Division and Sub Division."
     eff = effective.strftime("%Y-%m-%d")
     con = connect()
     try:
-        old = con.execute("SELECT key, station, office_id, division, sub_division FROM master WHERE key=?",
-                          (key,)).fetchone()
+        old = con.execute("SELECT * FROM master WHERE key=?", (key,)).fetchone()
         if old is None:
             return False, "The selected station is no longer in the master."
         old = dict(old)
+        has_addr = "address" in old
+        cur_addr = str(old.get("address") or "").strip()
+        new_address = (new_address or "").strip()
+        addr_changed = has_addr and bool(new_address) and new_address != cur_addr
         if con.execute("SELECT 1 FROM master WHERE division=? AND sub_division=? LIMIT 1",
                        (new_div, new_sub)).fetchone() is None:
             return False, "This Sub Division does not exist under the selected Division in the master."
-        if (old["division"], old["sub_division"]) == (new_div, new_sub):
+        same_place = (old["division"], old["sub_division"]) == (new_div, new_sub)
+        if same_place and not addr_changed:
             return False, "The station is already in this Division and Sub Division."
         last = con.execute("SELECT MAX(effective_date) FROM station_transfers WHERE key=?", (key,)).fetchone()[0]
         if last and eff < last:
             return False, (f"This station already has a transfer effective {last[8:10]}-{last[5:7]}-{last[:4]}. "
                            "The new effective date must be on or after it.")
         con.execute("UPDATE master SET division=?, sub_division=? WHERE key=?", (new_div, new_sub, key))
+        if addr_changed:
+            con.execute("UPDATE master SET address=? WHERE key=?", (new_address, key))
         con.execute(
             "INSERT INTO station_transfers(key, station, office_id, old_division, old_sub_division,"
-            " new_division, new_sub_division, effective_date, changed_by, changed_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " new_division, new_sub_division, effective_date, changed_by, changed_at,"
+            " old_address, new_address) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (key, old["station"], old["office_id"], old["division"], old["sub_division"], new_div, new_sub,
-             eff, by, datetime.now().strftime("%Y-%m-%d %H:%M")))
+             eff, by, datetime.now().strftime("%Y-%m-%d %H:%M"),
+             cur_addr if addr_changed else None, new_address if addr_changed else None))
         con.commit()
     finally:
         con.close()
     clear_report_cache()
     audit("station.transfer", f"{old['station']} ({old['office_id']}): {old['division']}/{old['sub_division']}"
-                              f" -> {new_div}/{new_sub} effective {effective.strftime('%d-%m-%Y')}")
+                              f" -> {new_div}/{new_sub} effective {effective.strftime('%d-%m-%Y')}"
+                              + (f"; machine address -> {new_address}" if addr_changed else ""))
     kv_sync.request_backup()
     return True, (f"Station {old['station']} moved to {new_div} / {new_sub}, effective "
-                  f"{effective.strftime('%d-%m-%Y')}.")
+                  f"{effective.strftime('%d-%m-%Y')}."
+                  + (" Machine address updated." if addr_changed else ""))
 
 
 def undo_station_transfer(transfer_id):
@@ -828,6 +841,8 @@ def undo_station_transfer(transfer_id):
         return False, "This station was transferred again later. Undo the latest transfer first."
     run("UPDATE master SET division=?, sub_division=? WHERE key=?",
         (row["old_division"], row["old_sub_division"], row["key"]))
+    if row["new_address"] is not None:  # this transfer also changed the address
+        run("UPDATE master SET address=? WHERE key=?", (row["old_address"] or "", row["key"]))
     run("DELETE FROM station_transfers WHERE id=?", (transfer_id,))
     clear_report_cache()
     audit("station.transfer_undo", f"{row['station']}: back to {row['old_division']}/{row['old_sub_division']}")
@@ -838,10 +853,13 @@ def undo_station_transfer(transfer_id):
 def station_transfer_form():
     st.caption("Use this to move a station from one Division to another, or to a different Sub Division. "
                "Choose the new Division first - the Sub Division list then shows only that Division's "
-               "Sub Divisions. Reports for dates before the effective date keep showing the station under "
-               "its old Division. Every transfer is recorded in the activity log.")
-    master = read_sql("SELECT key, station, office_id, division, sub_division FROM master"
-                      " ORDER BY division, sub_division, station")
+               "Sub Divisions. You can also update the machine address here. Reports for dates before the "
+               "effective date keep showing the station under its old Division and old address. "
+               "Every transfer is recorded in the activity log.")
+    master = read_sql("SELECT * FROM master ORDER BY division, sub_division, station")
+    if "address" not in master.columns:
+        master["address"] = ""
+    master["address"] = master["address"].fillna("").astype(str).str.strip()
     retired = set(read_sql("SELECT old_key FROM station_changes")["old_key"])
     master = master[~master["key"].isin(retired) & (master["division"] != "")]
     divisions = get_divisions()
@@ -862,6 +880,10 @@ def station_transfer_form():
     subs = get_subdivisions(to_div)
     to_sub = c4.selectbox("To Sub Division", subs if subs else ["(none found in master)"],
                           key=f"stt_to_sub_{from_div}_{to_div}")
+    cur_addr = pool.loc[pool["key"] == opts[pick], "address"].iloc[0]
+    new_addr = st.text_input("Machine address (update if the machine moves to a new address; "
+                             "leave as it is to keep the current one)", value=cur_addr,
+                             key=f"stt_addr_{opts[pick]}")
     eff = st.date_input("Effective date (first day the station counts in the new Division)",
                         value=datetime.now().date(), format="DD-MM-YYYY", key="stt_eff")
     if st.button("Transfer station", key="stt_go"):
@@ -869,14 +891,16 @@ def station_transfer_form():
             st.warning("No Sub Division was found in the master for this Division.")
         else:
             ok, msg = register_station_transfer(opts[pick], to_div, to_sub, eff,
-                                                st.session_state["user"]["username"])
+                                                st.session_state["user"]["username"],
+                                                new_address=new_addr)
             if ok:
                 flash(msg)
             else:
                 st.error(msg)
 
     tr = read_sql("SELECT id, station, office_id, old_division, old_sub_division, new_division,"
-                  " new_sub_division, effective_date, changed_by, changed_at FROM station_transfers"
+                  " new_sub_division, effective_date, old_address, new_address, changed_by, changed_at"
+                  " FROM station_transfers"
                   " ORDER BY id DESC")
     if tr.empty:
         return
@@ -885,6 +909,7 @@ def station_transfer_form():
         "id": "ID", "station": "Station", "office_id": "Office ID", "old_division": "From Division",
         "old_sub_division": "From Sub Division", "new_division": "To Division",
         "new_sub_division": "To Sub Division", "effective_date": "Effective from",
+        "old_address": "Old Machine Address", "new_address": "New Machine Address",
         "changed_by": "Changed by", "changed_at": "Changed at"})
     st.dataframe(show, hide_index=True, use_container_width=True)
     latest_ids = set(read_sql("SELECT MAX(id) AS id FROM station_transfers GROUP BY key")["id"])
@@ -905,7 +930,7 @@ def station_change_section():
     if not table_exists("master"):
         st.info("Upload the master sheet first.")
         return
-    mode = st.radio("Action", ["Retire / change Station ID (with date)",
+    mode = st.radio("Action", ["Retire Station ID (with date)",
                                "Transfer station to another Division / Sub Division"],
                     horizontal=True, key="sc_mode")
     if mode.startswith("Retire"):
@@ -915,11 +940,11 @@ def station_change_section():
 
 
 def station_id_change_form():
-    st.markdown("**Retire / change Station ID**")
-    st.caption("Use this when a machine's station ID has changed. The old ID stays in the master so old "
-               "reports keep working, but it is not counted from the effective date onward. The new ID is "
-               "added to the master with the same office, division and sub division and is counted from "
-               "the effective date. Every change is recorded in the activity log.")
+    st.markdown("**Retire Station ID**")
+    st.caption("Use this when a station ID is no longer in use. The ID stays in the master so old "
+               "reports keep working, but it is not counted from the effective date onward. Reports for "
+               "dates before the effective date are not affected. No new ID is added. Every change is "
+               "recorded in the activity log.")
     if not table_exists("master"):
         st.info("Upload the master sheet first.")
         return
@@ -930,29 +955,28 @@ def station_id_change_form():
             for r in master.itertuples() if r.key not in done}
     if opts:
         with st.form("station_change_form", clear_on_submit=True):
-            pick = st.selectbox("Old station ID", list(opts))
-            new_id = st.text_input("New station ID")
-            eff = st.date_input("Effective date (first day the new ID is used)",
+            pick = st.selectbox("Station ID to retire", list(opts))
+            eff = st.date_input("Effective date (first day the ID is no longer counted)",
                                 value=datetime.now().date(), format="DD-MM-YYYY")
-            if st.form_submit_button("Save station ID change"):
-                ok, msg = register_station_change(opts[pick], new_id, eff,
+            if st.form_submit_button("Retire station ID"):
+                ok, msg = register_station_change(opts[pick], eff,
                                                   st.session_state["user"]["username"])
                 if ok:
                     flash(msg)
                 else:
                     st.error(msg)
-    ch = read_sql("SELECT id, old_station, new_station, division, sub_division, effective_date,"
+    ch = read_sql("SELECT id, old_station, division, sub_division, effective_date,"
                   " changed_by, changed_at FROM station_changes ORDER BY id DESC")
     if ch.empty:
         return
     show = ch.assign(effective_date=pd.to_datetime(ch["effective_date"], errors="coerce")
                      .dt.strftime("%d-%m-%Y")).rename(columns={
-        "id": "ID", "old_station": "Old station ID", "new_station": "New station ID",
+        "id": "ID", "old_station": "Retired station ID",
         "division": "Division", "sub_division": "Sub Division", "effective_date": "Effective from",
         "changed_by": "Changed by", "changed_at": "Changed at"})
     st.dataframe(show, hide_index=True, use_container_width=True)
-    with st.expander("Undo a station ID change"):
-        labels = {f"#{r.id}: {r.old_station} -> {r.new_station}": r.id for r in ch.itertuples()}
+    with st.expander("Undo a station ID retirement"):
+        labels = {f"#{r.id}: {r.old_station} retired": r.id for r in ch.itertuples()}
         pick_u = st.selectbox("Change to undo", list(labels), key="sc_undo_pick")
         if st.button("Undo this change", key="sc_undo_btn"):
             ok, msg = undo_station_change(labels[pick_u])
@@ -1807,6 +1831,26 @@ def machine_address_map(ids):
     except Exception:
         master = {}
     daily.update(master)  # master wins wherever it has an address
+    # A transfer that updated the address only applies from its effective date. If the
+    # whole selected period ends before it, show the address the machine had then
+    # (same rule apply_station_transfers uses for Division / Sub Division).
+    try:
+        tr = read_sql("SELECT key, old_address, effective_date, id FROM station_transfers"
+                      " WHERE new_address IS NOT NULL AND TRIM(new_address) <> ''"
+                      " ORDER BY effective_date, id")
+        if not tr.empty:
+            marks = ",".join("?" * len(ids))
+            labels = run(f"SELECT label FROM uploads WHERE id IN ({marks})", tuple(ids), many=True)
+            dates = [parse_label_date(r["label"]) for r in labels]
+            if dates and all(d is not None for d in dates):
+                end = max(dates)
+                tr["_eff"] = pd.to_datetime(tr["effective_date"], errors="coerce").dt.date
+                future = tr[tr["_eff"].notna() & (tr["_eff"] > end)].drop_duplicates("key", keep="first")
+                for k, a in zip(future["key"], future["old_address"]):
+                    if isinstance(a, str) and a.strip():
+                        daily[k] = a.strip()
+    except Exception:
+        pass
     return daily
 
 

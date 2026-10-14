@@ -2754,6 +2754,73 @@ def mbu_camps_section():
                 flash("MBU camp row deleted.")
 
 
+def consolidated_camp_report():
+    """One row per Division combining general camps and MBU camps.
+
+    Shown at the very end of the Camps tab, whichever section is open. The
+    period defaults to the current month start through the latest camp date;
+    earlier months can be picked manually. MBU camps are placed by their start date.
+    """
+    st.divider()
+    st.subheader("Consolidated Division-wise camp report")
+
+    gen = read_sql("SELECT camp_date, division, transactions FROM camps") if table_exists("camps") \
+        else pd.DataFrame(columns=["camp_date", "division", "transactions"])
+    mbu = read_sql("SELECT camp_date, division, transactions FROM mbu_camps") if table_exists("mbu_camps") \
+        else pd.DataFrame(columns=["camp_date", "division", "transactions"])
+    gen["_d"] = pd.to_datetime(gen["camp_date"], format="%d-%m-%Y", errors="coerce").dt.date
+    mbu["_d"] = pd.to_datetime(mbu["camp_date"], format="%Y-%m-%d", errors="coerce").dt.date
+    for df in (gen, mbu):
+        df["transactions"] = pd.to_numeric(df["transactions"], errors="coerce")
+    dates = list(gen["_d"].dropna()) + list(mbu["_d"].dropna())
+    if not dates:
+        st.info("No camp data yet.")
+        return
+
+    lo, hi = min(dates), max(dates)
+    default_start = max(lo, date.today().replace(day=1))
+    if default_start > hi:
+        default_start = max(lo, hi.replace(day=1))
+    rng = st.date_input("Date range (from - to)", value=(default_start, hi), min_value=lo, max_value=hi,
+                        format="DD-MM-YYYY", key="camp_consol_rng")
+    if not (isinstance(rng, tuple) and len(rng) == 2):
+        st.info("Select the end date to complete the range.")
+        return
+    start, end = rng
+    gen = gen[gen["_d"].notna() & (gen["_d"] >= start) & (gen["_d"] <= end)]
+    mbu = mbu[mbu["_d"].notna() & (mbu["_d"] >= start) & (mbu["_d"] <= end)]
+
+    def _by_div(df, prefix):
+        out = df.assign(_k=df["division"].map(parsers.norm)).groupby("_k").agg(
+            **{f"{prefix}_name": ("division", "first"), f"{prefix}_n": ("division", "size"),
+               f"{prefix}_tx": ("transactions", "sum"), f"{prefix}_done": ("transactions", "count")})
+        return out
+
+    g, m = _by_div(gen, "g"), _by_div(mbu, "m")
+    c = g.join(m, how="outer")
+    if c.empty:
+        st.info("No camps fall in this date range.")
+        return
+    c["Division"] = c["g_name"].fillna(c["m_name"])
+    for col in ("g_n", "g_tx", "m_n", "m_tx", "m_done"):
+        c[col] = c[col].fillna(0).astype(int)
+    out = pd.DataFrame({
+        "Division": c["Division"],
+        "Camps": c["g_n"], "Camp Transactions": c["g_tx"],
+        "MBU Camps": c["m_n"], "MBU Pending": c["m_n"] - c["m_done"], "MBU Transactions": c["m_tx"],
+    }).sort_values("Division").reset_index(drop=True)
+    grand = pd.DataFrame([["Grand Total"] + [int(out[col].sum()) for col in out.columns[1:]]],
+                         columns=out.columns)
+    out = pd.concat([out, grand], ignore_index=True)
+    st.caption("Camps = general camp entries. MBU Pending = MBU camps with no transactions entered yet.")
+    st.dataframe(out, hide_index=True, use_container_width=True)
+    e1, e2 = st.columns(2)
+    e1.download_button("Download CSV", out.to_csv(index=False).encode("utf-8-sig"),
+                       "aadhaar_camp_consolidated_division_report.csv", "text/csv", key="camp_consol_csv")
+    with e2:
+        excel_download(out, "Consolidated", "aadhaar_camp_consolidated_division_report.xlsx", "Download Excel")
+
+
 def camps_tab():
     section = st.radio("Camps", ["Camps", "MBU Camps"], horizontal=True, key="camps_section",
                        label_visibility="collapsed")
@@ -2761,6 +2828,7 @@ def camps_tab():
         mbu_camps_section()
     else:
         general_camps_section()
+    consolidated_camp_report()
 
 
 def general_camps_section():

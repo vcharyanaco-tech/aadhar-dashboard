@@ -64,6 +64,7 @@ committed secrets.
 | `AADHAR_SYNC_TOKEN` | to enable the bridge | none | Bearer token for the bridge. Must match the Worker's `BRIDGE_TOKEN` secret. |
 | `AADHAR_SYNC_INTERVAL_MS` | no | `3600000` | Periodic snapshot cadence (1 hour) |
 | `AADHAR_SYNC_MIN_INTERVAL_MS` | no | `900000` | Floor between two pushes (15 min), so a burst of edits costs one push |
+| `AADHAR_SYNC_CHECKPOINT_MS` | no | `86400000` | Even when unchanged, upload a fresh generation at least this often (24 h). `0` disables the checkpoint. |
 | `AADHAR_SYNC_MAX_BYTES` | no | `20971520` | Refuse to push a snapshot above this size (20 MiB; Workers KV caps a value at 25) |
 | `AADHAR_DEFAULT_TEMP_PASSWORD` | no | random per batch | Shared initial password for bulk-created division logins. Unset means a random password is generated for each batch and shown once. |
 | `SESSION_TIMEOUT_MINUTES` | no | `30` | Idle logout. `0` disables it. Streamlit reruns on every interaction, so this is a reliable activity signal. |
@@ -71,6 +72,14 @@ committed secrets.
 
 The bridge is off unless both `AADHAR_SYNC_URL` and `AADHAR_SYNC_TOKEN` are set,
 so local development is unaffected.
+
+Snapshots are gzipped before upload and skipped when the database hash is
+unchanged. A fresh generation is still forced at least once a day, so an idle
+but healthy backup does not look stale, and restore accepts both gzipped and
+legacy raw-SQLite snapshots. This keeps the ~5.6 MB hourly upload from
+exhausting Render's 5 GB monthly egress allowance. The client automatically
+falls back to a raw PUT if it is talking to an older Worker that does not
+understand gzip, so the client and Worker can be deployed in either order.
 
 ### Known gaps
 
@@ -219,7 +228,7 @@ Endpoints, all requiring `Authorization: Bearer <BRIDGE_TOKEN>` except `/health`
 | --- | --- | --- |
 | `GET` | `/health` | Snapshot age, budget, retention. Unauthenticated, returns no database content. |
 | `GET` | `/db` | Download the newest snapshot |
-| `PUT` | `/db` | Push a new snapshot |
+| `PUT` | `/db` | Push a new snapshot. Accepts raw SQLite or a gzip body (sniffed by magic; optional `X-Backup-Encoding: gzip` header). The Worker decompresses and stores raw SQLite. |
 | `GET` | `/db/<generation>` | Download a specific snapshot, for rollback |
 | `GET` | `/generations` | List retained snapshots |
 | `GET` | `/stats` | Push accounting |
@@ -233,12 +242,23 @@ npx wrangler secret put BRIDGE_TOKEN   # must match AADHAR_SYNC_TOKEN on Render
 npx wrangler deploy
 ```
 
+Deploy the Worker before the Render service when possible. It accepts both raw
+and gzip PUTs, so an old client keeps working; if the order is reversed, the
+client's raw fallback keeps pushes working until the next restart.
+
 **How durability works**
 
 - Each push writes a new `aadhar:gen:<timestamp>-<rand>` key and then moves the
   `aadhar:latest` pointer, so an interrupted push can never corrupt the snapshot a
   restore would use. The last `RETAIN` (12) generations are kept, which at ~5.6 MB
   is roughly 67 MB — far inside the 1 GB free-tier allowance.
+- The client hashes the raw snapshot and skips the push when it matches the last
+  accepted generation, except for a checkpoint at least once a day. Changed
+  snapshots are gzipped on the wire (~1.9x for this database) and decompressed
+  by the Worker before the SQLite magic check and KV write, so storage, rollback
+  generations and restore stay raw. An old Worker rejects gzip before writing
+  anything; the client retries raw and pauses compression for six hours before
+  probing again.
 - The **daily push budget is enforced in the Worker**, not in the app. The old
   client counted writes in a module-level dict that reset on every Render
   restart, so its 400/day cap was never actually enforced. The Worker refuses

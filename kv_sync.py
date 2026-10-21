@@ -19,6 +19,11 @@ stored snapshots cannot be exhausted or deleted by another project.
 Every function is a no-op when the bridge is not configured, so the app runs
 unchanged on a developer laptop or on a host with a real disk.
 
+Bandwidth: changed snapshots are gzipped before the PUT (the Worker decompresses
+and stores raw SQLite), and an unchanged snapshot is not uploaded at all. This
+keeps the ~5.6 MB hourly snapshot from exhausting Render's 5 GB monthly egress
+allowance. Restore accepts both gzipped and legacy raw snapshots.
+
 DESIGN NOTES — why this looks the way it does
 --------------------------------------------
 * The old bridge never worked. It asked for `/api/backup/aadhaar-db` but the
@@ -39,6 +44,8 @@ still starts, so a failure degrades rather than boot-looping.
 
 import atexit
 import calendar
+import gzip
+import hashlib
 import json
 import os
 import re
@@ -69,6 +76,12 @@ TOKEN = os.environ.get("AADHAR_SYNC_TOKEN") or ""
 # two pushes no matter how many writes land in between.
 INTERVAL_MS = int(float(os.environ.get("AADHAR_SYNC_INTERVAL_MS") or 60 * 60 * 1000))
 MIN_INTERVAL_MS = int(float(os.environ.get("AADHAR_SYNC_MIN_INTERVAL_MS") or 15 * 60 * 1000))
+# Dedupe skips an unchanged snapshot, but not forever: a fresh generation at
+# least once a day keeps the bridge's age meaningful and bounds rollback loss.
+_CHECKPOINT_ENV = os.environ.get("AADHAR_SYNC_CHECKPOINT_MS")
+CHECKPOINT_MS = (
+    int(float(_CHECKPOINT_ENV)) if _CHECKPOINT_ENV not in (None, "") else 24 * 60 * 60 * 1000
+)
 MAX_BYTES = int(float(os.environ.get("AADHAR_SYNC_MAX_BYTES") or 20 * 1024 * 1024))
 FETCH_TIMEOUT_MS = 60000
 
@@ -87,19 +100,37 @@ DATA_TABLES = ("master", "tx", "operator_master")
 
 _stats = {
     "last_backup_at": None,
+    "last_upload_at": None,
+    "last_checked_at": None,
     "last_error": None,
     "consecutive_failures": 0,
     "db_bytes": 0,
+    "stored_bytes": 0,
     "restored": False,
     "restored_from": None,
     "last_pushed_generation": None,
+    "last_encoding": None,
     "skipped_budget": False,
     "skipped_size": False,
     "skipped_min_interval": False,
     "skipped_empty": False,
+    "skipped_unchanged": 0,
 }
 _lock = threading.Lock()
 _thread_started = False
+
+# SHA-256 of the raw bytes of the last snapshot the bridge accepted, and whether
+# this Worker build understands gzip. Both are process-local: restore_data()
+# seeds the hash after a cold start, while a host with a real disk uploads once
+# and then idles. If an older Worker rejects a gzipped PUT, the client retries
+# the same snapshot raw and pauses compression for six hours; that makes the
+# client safe to deploy before the Worker.
+_last_hash = None
+_gzip_enabled = True
+# After an old Worker rejects gzip, re-probe occasionally instead of either
+# hammering it with a compressed body on every push or waiting forever for a
+# process restart. Six hours costs at most one rejected upload per window.
+_gzip_retry_at = 0.0
 
 # Push scheduling. `request_backup()` marks the database dirty and a background
 # timer does the pushing, so a burst of edits costs one push, not one per edit.
@@ -125,6 +156,28 @@ def _iso(ts=None):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts if ts is not None else _now()))
 
 
+def _sha256(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _generation_epoch(generation):
+    """Unix seconds encoded in a generation id like '1729000000000-abcdef'."""
+    match = re.match(r"^(\d{13})-", str(generation or ""))
+    return int(match.group(1)) / 1000.0 if match else None
+
+
+def _encode_snapshot(raw):
+    """gzip before the PUT; mtime=0 keeps the compressed bytes deterministic."""
+    return gzip.compress(raw, compresslevel=6, mtime=0)
+
+
+def _decode_snapshot(stored):
+    """Current snapshots may be gzip; older stored generations are raw SQLite."""
+    if stored[:2] == b"\x1f\x8b":
+        return gzip.decompress(stored)
+    return stored
+
+
 def enabled():
     return bool(BASE and TOKEN)
 
@@ -148,7 +201,13 @@ class BridgeError(Exception):
 
 def _call(method, path, payload=None, timeout=FETCH_TIMEOUT_MS):
     """One bridge request. Raises BridgeError on any non-2xx or transport failure."""
-    req = urllib.request.Request(BASE + path, data=payload, headers=_auth_headers(), method=method)
+    headers = _auth_headers()
+    # Custom header, not Content-Encoding: an intermediary must not transparently
+    # decode the body before the Worker can validate it. The Worker sniffs the
+    # gzip magic as well, so a stripped header is not fatal.
+    if payload and payload[:2] == b"\x1f\x8b":
+        headers["X-Backup-Encoding"] = "gzip"
+    req = urllib.request.Request(BASE + path, data=payload, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read()
@@ -265,6 +324,7 @@ def restore_data():
     a real disk is rolling a deploy and the previous instance may still hold the
     file open.
     """
+    global _last_hash, _last_push_at
     if not enabled():
         return {"restored": False, "reason": "disabled"}
     if DB.exists():
@@ -289,11 +349,17 @@ def restore_data():
 
         for generation, path in candidates:
             try:
-                raw, _ = _get(f"/db/{generation}") if path else _get("/db")
+                stored, _ = _get(f"/db/{generation}") if path else _get("/db")
             except BridgeError as err:
                 _log(f"generation {generation} could not be fetched ({err}); trying the next one")
                 continue
-            if not raw:
+            if not stored:
+                continue
+            try:
+                raw = _decode_snapshot(stored)
+            except Exception as err:
+                _stats["consecutive_failures"] += 1
+                _log(f"generation {generation} had an unreadable encoding ({err}); trying the next one")
                 continue
             ok, detail = _validate(raw, require_data=True)
             if not ok:
@@ -308,15 +374,36 @@ def restore_data():
                     Path(str(DB) + suffix).unlink()
                 except OSError:
                     pass
+            # If this was the newest candidate, the bridge already holds these
+            # exact bytes and the first interval tick must not push them back.
+            # If we had to walk back past a newer invalid generation, leave the
+            # hash unset so the next push repairs the latest pointer instead of
+            # silently preserving the bad one.
+            is_latest = generation == candidates[0][0]
+            _last_hash = _sha256(raw) if is_latest else None
+            if is_latest:
+                # The Worker's generation id carries its creation time. Reusing
+                # it keeps the daily checkpoint honest across a restart: a
+                # snapshot restored from an old generation is refreshed on the
+                # next cycle, while a fresh one is not needlessly re-uploaded.
+                restored_epoch = _generation_epoch(generation)
+                if restored_epoch is not None:
+                    _last_push_at = restored_epoch
             _stats["restored"] = True
             _stats["restored_from"] = generation
             _stats["db_bytes"] = len(raw)
+            _stats["stored_bytes"] = len(stored)
+            _stats["last_checked_at"] = _iso()
             _stats["last_error"] = None
+            encoding = "gzip" if stored[:2] == b"\x1f\x8b" else "raw"
             if generation == candidates[0][0] and len(candidates) > 1:
-                _log(f"restored generation {generation} ({len(raw)} bytes) after rejecting newer ones")
+                _log(f"restored generation {generation} ({len(raw)} bytes, {encoding}) "
+                     "after rejecting newer ones")
             else:
-                _log(f"restored aadhaar.db from the bridge ({len(raw)} bytes, generation {generation})")
-            return {"restored": True, "bytes": len(raw), "generation": generation}
+                _log(f"restored aadhaar.db from the bridge ({len(raw)} bytes, {encoding}, "
+                     f"generation {generation})")
+            return {"restored": True, "bytes": len(raw), "generation": generation,
+                    "stored_bytes": len(stored), "encoding": encoding}
 
         _stats["last_error"] = "every stored generation failed validation"
         _log(_stats["last_error"])
@@ -366,14 +453,21 @@ def restore_generation(generation, keep_backup=True):
     `aadhaar.db.pre-rollback`, and the caller is expected to have confirmed with a
     human first.
     """
+    global _last_hash
     if not enabled():
         return {"restored": False, "reason": "disabled"}
     if not is_valid_gen(generation):
         return {"restored": False, "reason": "bad_generation"}
     try:
-        raw, _ = _get(f"/db/{generation}")
-        if not raw:
+        stored, _ = _get(f"/db/{generation}")
+        if not stored:
             return {"restored": False, "reason": "not_found", "generation": generation}
+        try:
+            raw = _decode_snapshot(stored)
+        except Exception as err:
+            _record_failure(f"rejected generation {generation}: unreadable encoding ({err})")
+            _log(f"rollback refused, snapshot not written (unreadable encoding: {err})")
+            return {"restored": False, "reason": "bad_encoding", "generation": generation}
         ok, detail = _validate(raw)
         if not ok:
             _record_failure(f"rejected generation {generation}: {detail}")
@@ -393,14 +487,23 @@ def restore_generation(generation, keep_backup=True):
             except OSError:
                 pass
 
+        # A rollback deliberately differs from the current latest generation.
+        # Do not dedupe it away on the next cycle: leave the hash unset so the
+        # rolled-back database is republished and a later restart restores it,
+        # rather than the generation the operator just rolled back from.
+        _last_hash = None
         _stats["restored"] = True
         _stats["restored_from"] = generation
         _stats["db_bytes"] = len(raw)
+        _stats["stored_bytes"] = len(stored)
+        _stats["last_checked_at"] = _iso()
         _stats["last_error"] = None
         _stats["consecutive_failures"] = 0
-        _log(f"rolled back to generation {generation} ({len(raw)} bytes)"
+        encoding = "gzip" if stored[:2] == b"\x1f\x8b" else "raw"
+        _log(f"rolled back to generation {generation} ({len(raw)} bytes, {encoding})"
              + (f"; previous file kept at {backup_path.name}" if backup_path else ""))
         return {"restored": True, "bytes": len(raw), "generation": generation,
+                "stored_bytes": len(stored), "encoding": encoding,
                 "backup": str(backup_path) if backup_path else None}
     except BridgeError as err:
         _record_failure(str(err))
@@ -472,7 +575,7 @@ def backup_data(force=False, reason="manual"):
     if not DB.exists():
         return {"backed_up": False, "reason": "no local db"}
 
-    global _last_push_at, _dirty, _dirty_since
+    global _last_push_at, _dirty, _dirty_since, _last_hash, _gzip_enabled, _gzip_retry_at
 
     if not force and _last_push_at is not None:
         since = (_now() - _last_push_at) * 1000.0
@@ -494,6 +597,24 @@ def backup_data(force=False, reason="manual"):
             _log(f"not pushed: snapshot is {len(payload)} bytes, over the {MAX_BYTES} byte cap")
             return {"backed_up": False, "error": _stats["last_error"]}
 
+        # Dedupe first: an unchanged database costs no PUT, no Worker budget,
+        # and no Render egress. The hash is seeded by restore_data(), so the
+        # startup heartbeat after a restore also becomes a no-op.
+        digest = _sha256(payload)
+        _stats["last_checked_at"] = _iso()
+        _stats["db_bytes"] = len(payload)
+        checkpoint_due = CHECKPOINT_MS > 0 and (
+            _last_push_at is None
+            or (_now() - _last_push_at) * 1000.0 >= CHECKPOINT_MS
+        )
+        if digest == _last_hash and not checkpoint_due:
+            _stats["skipped_unchanged"] += 1
+            _log(f"snapshot unchanged; skipped upload "
+                 f"(checked {_stats['skipped_unchanged']}x)")
+            return {"backed_up": True, "skipped": "unchanged", "bytes": len(payload)}
+        if digest == _last_hash:
+            _log("snapshot unchanged, but the daily checkpoint is due; uploading")
+
         # The guard that would have stopped the data loss. A database with no
         # users cannot be logged into, so it is what a boot that failed to
         # restore leaves behind. Pushing one over a good snapshot destroys the
@@ -510,9 +631,38 @@ def backup_data(force=False, reason="manual"):
                 return {"backed_up": False, "error": _stats["last_error"]}
             _log("bridge is empty, so the empty first-install database is being pushed")
 
-        # The PUT response carries the Worker's authoritative accounting, so
-        # there is no need for a second round trip to learn the budget state.
-        _, body, _ = _call("PUT", "/db", payload=payload)
+        if not _gzip_enabled and _gzip_retry_at and _now() >= _gzip_retry_at:
+            _gzip_enabled = True
+            _gzip_retry_at = 0.0
+
+        stored = payload
+        encoding = "raw"
+        body = b""
+        if _gzip_enabled:
+            stored = _encode_snapshot(payload)
+            encoding = "gzip"
+            try:
+                _, body, _ = _call("PUT", "/db", payload=stored)
+            except BridgeError as err:
+                # Rolling deployments: the client may ship before the Worker
+                # understands gzip. The old Worker validates SQLite magic and
+                # rejects the compressed body before writing anything, so a raw
+                # retry is safe. Disable compression for this process; a restart
+                # re-probes after the Worker is deployed.
+                if err.status == 400 and (err.payload or {}).get("error") in (
+                        "not_sqlite", "bad_gzip", "unsupported_encoding"):
+                    _gzip_enabled = False
+                    _gzip_retry_at = _now() + 6 * 60 * 60
+                    _log("bridge rejected gzip; retrying raw and pausing compression for "
+                         "6h (deploy backup-worker/worker.js to enable it)")
+                    stored = payload
+                    encoding = "raw"
+                    _, body, _ = _call("PUT", "/db", payload=stored)
+                else:
+                    raise
+        else:
+            _, body, _ = _call("PUT", "/db", payload=stored)
+
         try:
             info = json.loads(body.decode("utf-8")) if body else {}
         except Exception:
@@ -521,11 +671,20 @@ def backup_data(force=False, reason="manual"):
         _last_push_at = _now()
         _dirty = False
         _dirty_since = None
+        _last_hash = digest
+        _stats["stored_bytes"] = len(stored)
+        _stats["last_encoding"] = encoding
+        _stats["last_upload_at"] = _iso()
         _record_success(info)
-        _log(f"pushed aadhaar.db ({len(payload)} bytes) as generation "
-             f"{_stats['last_pushed_generation']}, writes today "
+        # The Worker reports the stored (decompressed) byte count; keep the
+        # status number tied to the local snapshot even if an old Worker's
+        # response omits it.
+        _stats["db_bytes"] = len(payload)
+        _log(f"pushed aadhaar.db ({len(payload)} -> {len(stored)} bytes {encoding}) "
+             f"as generation {_stats['last_pushed_generation']}, writes today "
              f"{info.get('pushesToday', '?')}/{info.get('dailyPushBudget', '?')}")
-        return {"backed_up": True, "bytes": len(payload),
+        return {"backed_up": True, "bytes": len(payload), "stored_bytes": len(stored),
+                "encoding": encoding,
                 "generation": _stats["last_pushed_generation"],
                 "pushes_today": info.get("pushesToday"),
                 "pushes_left": info.get("pushesLeft")}
@@ -759,8 +918,13 @@ def get_status():
         "restored_from": _stats["restored_from"],
         "last_backup_at": _stats["last_backup_at"],
         "last_backup_age_seconds": _age(_stats["last_backup_at"]),
+        "last_upload_at": _stats["last_upload_at"],
+        "last_checked_at": _stats["last_checked_at"],
+        "last_checked_age_seconds": _age(_stats["last_checked_at"]),
         "newest_snapshot_age_seconds": remote_age,
         "db_bytes": _stats["db_bytes"],
+        "stored_bytes": _stats["stored_bytes"],
+        "last_encoding": _stats["last_encoding"],
         "last_pushed_generation": _stats["last_pushed_generation"],
         "pending_changes": dirty,
         "pending_since": _iso(dirty_since) if dirty_since else None,
@@ -769,12 +933,14 @@ def get_status():
         "skipped_budget": _stats["skipped_budget"],
         "skipped_size": _stats["skipped_size"],
         "skipped_min_interval": _stats["skipped_min_interval"],
+        "skipped_unchanged": _stats["skipped_unchanged"],
         "writes_today": (bridge or {}).get("pushesToday"),
         "budget": (bridge or {}).get("dailyPushBudget"),
         "budget_left": (bridge or {}).get("pushesLeft"),
         "max_bytes": MAX_BYTES,
         "interval_minutes": INTERVAL_MS // 60000,
         "min_interval_minutes": MIN_INTERVAL_MS // 60000,
+        "checkpoint_minutes": CHECKPOINT_MS // 60000,
         "healthy": _is_healthy(bridge, bridge_error),
     }
 
@@ -798,8 +964,17 @@ def _is_healthy(bridge, bridge_error):
     age = bridge.get("ageSeconds")
     if age is None:
         return False
-    # Older than two intervals means the scheduler is not keeping up.
-    return age <= (INTERVAL_MS / 1000.0) * 2
+    if age <= (INTERVAL_MS / 1000.0) * 2:
+        return True
+    # Dedupe deliberately stops creating generations when nothing changes, so
+    # the newest snapshot legitimately ages past two intervals. If this process
+    # checked recently and its local hash still matches the last accepted
+    # snapshot, the old generation is the current data, not a stale backup.
+    checked_age = _age(_stats.get("last_checked_at"))
+    if _last_hash and checked_age is not None and checked_age <= (INTERVAL_MS / 1000.0) * 2:
+        return True
+    # Otherwise older than two intervals means the scheduler is not keeping up.
+    return False
 
 
 def _age(iso_ts):

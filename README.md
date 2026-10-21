@@ -115,14 +115,14 @@ things a reader of this file would otherwise assume work.
   figures.
 - **The public URL is `https://dashboardharyana.site/aadhar-dashboard/`.** It has
   not changed. The dash-site Worker proxies that prefix to the Render origin
-  (`aadhar-dashboard-5i4x.onrender.com`, a `AADHAR_ORIGIN` secret) and forwards
+  (`aadhar-dashboard-9ljo.onrender.com`, a `AADHAR_ORIGIN` secret) and forwards
   WebSocket upgrades, redirecting the old `/aadhar.html` and
   `/aadhar-dashboard/index.html` paths to the canonical form. The proxy adds
   `X-Frame-Options: SAMEORIGIN`, `frame-ancestors 'self'`, `nosniff` and a
   `Referrer-Policy`, and strips the origin's `Access-Control-Allow-Origin: *`.
   The origin URL behind it is not something users should be given.
 - **The origin itself is unprotected and reachable.** Going straight to
-  `aadhar-dashboard-5i4x.onrender.com` returns no security headers at all and
+  `aadhar-dashboard-9ljo.onrender.com` returns no security headers at all and
   `Access-Control-Allow-Origin: *`. Render's free plan has no IP allowlist, so
   the proxy is a hardening layer rather than a boundary. `proxy-worker/` adds a
   stricter header set but is redundant while the dash-site proxy is in place.
@@ -181,17 +181,22 @@ safety net rather than the mechanism.
 ## Deployment
 
 `render.yaml` defines a Blueprint: a Python web service on the free plan in
-`oregon`, matching the existing `dash-site` service.
+`oregon`. Production runs in a dedicated Render workspace separate from
+`dash-site`, so the two dashboards do not share the same 5 GB monthly free-tier
+bandwidth allowance or suspension blast radius.
 
 ```
 buildCommand: pip install -r requirements.txt
 startCommand: python boot.py
 ```
 
-Apply the Blueprint in Render and supply `AADHAR_SYNC_TOKEN` when prompted. Render
-prompts for it rather than taking the value from the repository, so it is never
-committed. Create the admin account through the first-run screen after the first
-deploy.
+The current service is `srv-dbcadio473hc73fkdu30` at
+`https://aadhar-dashboard-9ljo.onrender.com`. It was created through the Render
+API because the old workspace was out of bandwidth; `render.yaml` remains the
+source of truth for its build, start, region and environment settings. Supply
+`AADHAR_SYNC_TOKEN` when applying it; Render prompts for the value rather than
+taking it from the repository, so it is never committed. Create the admin
+account through the first-run screen after the first deploy.
 
 ### Surviving the free plan's lack of a disk
 
@@ -301,9 +306,10 @@ holding no backups at all.
 wins, so the effective production values come from `boot.py`.
 
 The public URL is proxied by the dash-site Worker under `/aadhar-dashboard/*`
-using its `AADHAR_ORIGIN` secret. Normally that points at the Render URL; while
-Render is suspended it points at a local Cloudflare quick tunnel. The base path
-and WebSocket configuration are unchanged.
+using its `AADHAR_ORIGIN` secret. It points at the dedicated Render service;
+`run-aadhar.ps1` can temporarily repoint it at a local Cloudflare quick tunnel
+for an emergency fallback. The base path and WebSocket configuration are
+unchanged.
 
 #### The keep-alive Worker
 
@@ -415,6 +421,9 @@ one. Until then, `tools/check_backup_health.py` says so on every run.
   `parsers.quote_ident`, which rejects anything that is not a bare identifier, so
   a future caller forwarding user input fails loudly instead of building
   injectable SQL.
+- The dedicated Render API key, Cloudflare deploy token and bridge token live
+  only in gitignored `.render.local`, `.cloudflare.local` and `.env.local`.
+  Never commit, print or copy those files into another repository.
 
 ## Layout
 

@@ -64,6 +64,7 @@ committed secrets.
 | `AADHAR_SYNC_TOKEN` | to enable the bridge | none | Bearer token for the bridge. Must match the Worker's `BRIDGE_TOKEN` secret. |
 | `AADHAR_SYNC_INTERVAL_MS` | no | `3600000` | Periodic snapshot cadence (1 hour) |
 | `AADHAR_SYNC_MIN_INTERVAL_MS` | no | `900000` | Floor between two pushes (15 min), so a burst of edits costs one push |
+| `AADHAR_SYNC_CHECKPOINT_MS` | no | `86400000` | Even when unchanged, upload a fresh generation at least this often (24 h). `0` disables the checkpoint. |
 | `AADHAR_SYNC_MAX_BYTES` | no | `20971520` | Refuse to push a snapshot above this size (20 MiB; Workers KV caps a value at 25) |
 | `AADHAR_DEFAULT_TEMP_PASSWORD` | no | random per batch | Shared initial password for bulk-created division logins. Unset means a random password is generated for each batch and shown once. |
 | `SESSION_TIMEOUT_MINUTES` | no | `30` | Idle logout. `0` disables it. Streamlit reruns on every interaction, so this is a reliable activity signal. |
@@ -71,6 +72,14 @@ committed secrets.
 
 The bridge is off unless both `AADHAR_SYNC_URL` and `AADHAR_SYNC_TOKEN` are set,
 so local development is unaffected.
+
+Snapshots are gzipped before upload and skipped when the database hash is
+unchanged. A fresh generation is still forced at least once a day, so an idle
+but healthy backup does not look stale, and restore accepts both gzipped and
+legacy raw-SQLite snapshots. This keeps the ~5.6 MB hourly upload from
+exhausting Render's 5 GB monthly egress allowance. The client automatically
+falls back to a raw PUT if it is talking to an older Worker that does not
+understand gzip, so the client and Worker can be deployed in either order.
 
 ### Known gaps
 
@@ -106,14 +115,14 @@ things a reader of this file would otherwise assume work.
   figures.
 - **The public URL is `https://dashboardharyana.site/aadhar-dashboard/`.** It has
   not changed. The dash-site Worker proxies that prefix to the Render origin
-  (`aadhar-dashboard-5i4x.onrender.com`, a `AADHAR_ORIGIN` secret) and forwards
+  (`aadhar-dashboard-9ljo.onrender.com`, a `AADHAR_ORIGIN` secret) and forwards
   WebSocket upgrades, redirecting the old `/aadhar.html` and
   `/aadhar-dashboard/index.html` paths to the canonical form. The proxy adds
   `X-Frame-Options: SAMEORIGIN`, `frame-ancestors 'self'`, `nosniff` and a
   `Referrer-Policy`, and strips the origin's `Access-Control-Allow-Origin: *`.
   The origin URL behind it is not something users should be given.
 - **The origin itself is unprotected and reachable.** Going straight to
-  `aadhar-dashboard-5i4x.onrender.com` returns no security headers at all and
+  `aadhar-dashboard-9ljo.onrender.com` returns no security headers at all and
   `Access-Control-Allow-Origin: *`. Render's free plan has no IP allowlist, so
   the proxy is a hardening layer rather than a boundary. `proxy-worker/` adds a
   stricter header set but is redundant while the dash-site proxy is in place.
@@ -172,17 +181,22 @@ safety net rather than the mechanism.
 ## Deployment
 
 `render.yaml` defines a Blueprint: a Python web service on the free plan in
-`oregon`, matching the existing `dash-site` service.
+`oregon`. Production runs in a dedicated Render workspace separate from
+`dash-site`, so the two dashboards do not share the same 5 GB monthly free-tier
+bandwidth allowance or suspension blast radius.
 
 ```
 buildCommand: pip install -r requirements.txt
 startCommand: python boot.py
 ```
 
-Apply the Blueprint in Render and supply `AADHAR_SYNC_TOKEN` when prompted. Render
-prompts for it rather than taking the value from the repository, so it is never
-committed. Create the admin account through the first-run screen after the first
-deploy.
+The current service is `srv-dbcadio473hc73fkdu30` at
+`https://aadhar-dashboard-9ljo.onrender.com`. It was created through the Render
+API because the old workspace was out of bandwidth; `render.yaml` remains the
+source of truth for its build, start, region and environment settings. Supply
+`AADHAR_SYNC_TOKEN` when applying it; Render prompts for the value rather than
+taking it from the repository, so it is never committed. Create the admin
+account through the first-run screen after the first deploy.
 
 ### Surviving the free plan's lack of a disk
 
@@ -219,7 +233,7 @@ Endpoints, all requiring `Authorization: Bearer <BRIDGE_TOKEN>` except `/health`
 | --- | --- | --- |
 | `GET` | `/health` | Snapshot age, budget, retention. Unauthenticated, returns no database content. |
 | `GET` | `/db` | Download the newest snapshot |
-| `PUT` | `/db` | Push a new snapshot |
+| `PUT` | `/db` | Push a new snapshot. Accepts raw SQLite or a gzip body (sniffed by magic; optional `X-Backup-Encoding: gzip` header). The Worker decompresses and stores raw SQLite. |
 | `GET` | `/db/<generation>` | Download a specific snapshot, for rollback |
 | `GET` | `/generations` | List retained snapshots |
 | `GET` | `/stats` | Push accounting |
@@ -233,12 +247,28 @@ npx wrangler secret put BRIDGE_TOKEN   # must match AADHAR_SYNC_TOKEN on Render
 npx wrangler deploy
 ```
 
+On the local fallback machine, `.\backup-worker\deploy.ps1` loads the scoped
+Cloudflare credential from the gitignored `../.cloudflare.local` and refuses any
+account other than the Aadhaar backup account. `-DryRun` bundles without
+uploading. The credential file is never committed.
+
+Deploy the Worker before the Render service when possible. It accepts both raw
+and gzip PUTs, so an old client keeps working; if the order is reversed, the
+client's raw fallback keeps pushes working until the next restart.
+
 **How durability works**
 
 - Each push writes a new `aadhar:gen:<timestamp>-<rand>` key and then moves the
   `aadhar:latest` pointer, so an interrupted push can never corrupt the snapshot a
   restore would use. The last `RETAIN` (12) generations are kept, which at ~5.6 MB
   is roughly 67 MB — far inside the 1 GB free-tier allowance.
+- The client hashes the raw snapshot and skips the push when it matches the last
+  accepted generation, except for a checkpoint at least once a day. Changed
+  snapshots are gzipped on the wire (~1.9x for this database) and decompressed
+  by the Worker before the SQLite magic check and KV write, so storage, rollback
+  generations and restore stay raw. An old Worker rejects gzip before writing
+  anything; the client retries raw and pauses compression for six hours before
+  probing again.
 - The **daily push budget is enforced in the Worker**, not in the app. The old
   client counted writes in a module-level dict that reset on every Render
   restart, so its 400/day cap was never actually enforced. The Worker refuses
@@ -275,9 +305,11 @@ holding no backups at all.
 `boot.py` overrides CORS and the upload size on the command line, and the flag
 wins, so the effective production values come from `boot.py`.
 
-There is no Cloudflare proxy in front of this service today. The dash-site Worker
-has no `/aadhar-dashboard/*` route and no `AADHAR_ORIGIN` binding, so the Render
-URL is the public entry point.
+The public URL is proxied by the dash-site Worker under `/aadhar-dashboard/*`
+using its `AADHAR_ORIGIN` secret. It points at the dedicated Render service;
+`run-aadhar.ps1` can temporarily repoint it at a local Cloudflare quick tunnel
+for an emergency fallback. The base path and WebSocket configuration are
+unchanged.
 
 #### The keep-alive Worker
 
@@ -389,6 +421,9 @@ one. Until then, `tools/check_backup_health.py` says so on every run.
   `parsers.quote_ident`, which rejects anything that is not a bare identifier, so
   a future caller forwarding user input fails loudly instead of building
   injectable SQL.
+- The dedicated Render API key, Cloudflare deploy token and bridge token live
+  only in gitignored `.render.local`, `.cloudflare.local` and `.env.local`.
+  Never commit, print or copy those files into another repository.
 
 ## Layout
 

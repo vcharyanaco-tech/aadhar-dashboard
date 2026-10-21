@@ -18,6 +18,9 @@ import urllib.request
 
 DEFAULT_URL = "https://aadhar-backup.aadhar-haryana.workers.dev"
 UA = "Mozilla/5.0 (compatible; aadhar-dashboard-healthcheck/1.0)"
+# The client skips unchanged snapshots, but forces a fresh generation at least
+# every 24 h; allow two hours of scheduler slack before calling it stale.
+MAX_SNAPSHOT_AGE_SECONDS = 26 * 3600
 
 
 def get(url, token, timeout=30, expect_json=True):
@@ -86,9 +89,10 @@ def main(argv):
         print("dash-site Worker. It is stale, not live, and is not where backups go now.")
         return 1
 
-    if age is not None and age > 2 * 3600:
+    if age is not None and age > MAX_SNAPSHOT_AGE_SECONDS:
         print()
-        print(f"UNHEALTHY  the newest snapshot is {age // 3600}h old, past two push intervals.")
+        print(f"UNHEALTHY  the newest snapshot is {age // 3600}h old, past the daily")
+        print("           checkpoint window. The client may be down or unable to push.")
         return 1
 
     print()

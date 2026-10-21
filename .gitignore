@@ -1,6 +1,12 @@
 node_modules/
 dist/
 *.local
+# Local Aadhaar bridge credentials (never commit)
+.env.local
+# Local Cloudflare deploy credential for the Aadhaar backup Worker (never commit)
+.cloudflare.local
+# Local Render API key for the Aadhaar-only Render account (never commit)
+.render.local
 *.tsbuildinfo
 .DS_Store
 .venv/

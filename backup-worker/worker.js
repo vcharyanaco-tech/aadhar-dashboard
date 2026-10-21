@@ -20,6 +20,11 @@
  *   and then moves the `aadhar:latest` pointer. An interrupted push can never
  *   corrupt the generation a restore would use, and older generations stay
  *   available for manual rollback.
+ * - Compressed transport. A client may gzip the PUT body (the Worker sniffs the
+ *   gzip magic and also accepts an `X-Backup-Encoding: gzip` header). The Worker
+ *   decompresses and validates it, then stores RAW SQLite, so restores, the
+ *   magic check, generation rollback and the health view stay unchanged. The
+ *   compressed body is what crosses Render's metered egress.
  * - Budget enforced HERE, not in the client. The client used to count writes in
  *   a module-level dict, which reset to zero on every Render restart, so the cap
  *   was never actually enforced. This Worker is the authority.
@@ -50,6 +55,49 @@ const DEFAULTS = { retain: 12, dailyPushBudget: 150, maxBytes: 20971520 };
 function num(v, fallback) {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+export function isGzip(buf) {
+  const head = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  return head.length >= 2 && head[0] === 0x1f && head[1] === 0x8b;
+}
+
+/**
+ * Decompress a gzipped snapshot, refusing to materialise more than `maxBytes`.
+ *
+ * A 5.6 MB database compresses to ~2.9 MB, which is what Render meters on the
+ * way out. The Worker still stores the RAW SQLite bytes so restores, the SQLite
+ * magic check, rollback generations and the health view stay unchanged.
+ */
+export async function gunzipLimited(buf, maxBytes) {
+  const body = new Response(buf).body;
+  if (!body) throw new Error('empty_body');
+  const reader = body.pipeThrough(new DecompressionStream('gzip')).getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        // The stream is already broken; the size error is what matters.
+      }
+      const err = new Error('too_large');
+      err.code = 'too_large';
+      throw err;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out.buffer;
 }
 
 function json(data, status = 200) {
@@ -112,6 +160,8 @@ async function budgetState(env) {
       pushes: 0,
       lastPushAt: (stored && stored.lastPushAt) || null,
       lastBytes: (stored && stored.lastBytes) || null,
+      lastReceivedBytes: (stored && stored.lastReceivedBytes) || null,
+      lastEncoding: (stored && stored.lastEncoding) || null,
       total: (stored && stored.total) || 0,
       gens: (stored && stored.gens) || [],
     };
@@ -152,6 +202,8 @@ async function readStats(env) {
     pushesLeft: Math.max(0, budgetCap - budget.pushes),
     lastPushAt: budget.lastPushAt,
     lastBytes: budget.lastBytes,
+    lastReceivedBytes: budget.lastReceivedBytes,
+    lastEncoding: budget.lastEncoding,
     totalPushes: budget.total,
     trackedGenerations: budget.gens.length,
     retain,
@@ -226,13 +278,61 @@ async function handlePut(request, env) {
     );
   }
 
-  const buf = await request.arrayBuffer();
-  const bytes = buf.byteLength;
+  let buf = await request.arrayBuffer();
+  const receivedBytes = buf.byteLength;
+  const advertised = (request.headers.get('X-Backup-Encoding') || '').toLowerCase();
+  const gzipped = advertised === 'gzip' || isGzip(buf);
 
+  if (receivedBytes === 0) return json({ ok: false, error: 'empty_body' }, 400);
+  if (receivedBytes > maxBytes) {
+    return json(
+      {
+        ok: false,
+        error: 'too_large',
+        bytes: receivedBytes,
+        receivedBytes,
+        maxBytes,
+        message: 'Snapshot exceeds the configured cap.',
+      },
+      413,
+    );
+  }
+
+  if (gzipped) {
+    try {
+      buf = await gunzipLimited(buf, maxBytes);
+    } catch (err) {
+      if (err && err.code === 'too_large') {
+        return json(
+          {
+            ok: false,
+            error: 'too_large',
+            receivedBytes,
+            maxBytes,
+            message: 'Decompressed snapshot exceeds the configured cap.',
+          },
+          413,
+        );
+      }
+      return json(
+        { ok: false, error: 'bad_gzip', receivedBytes, message: 'Body is not valid gzip.' },
+        400,
+      );
+    }
+  }
+
+  const bytes = buf.byteLength;
   if (bytes === 0) return json({ ok: false, error: 'empty_body' }, 400);
   if (bytes > maxBytes) {
     return json(
-      { ok: false, error: 'too_large', bytes, maxBytes, message: 'Snapshot exceeds the configured cap.' },
+      {
+        ok: false,
+        error: 'too_large',
+        bytes,
+        receivedBytes,
+        maxBytes,
+        message: 'Decompressed snapshot exceeds the configured cap.',
+      },
       413,
     );
   }
@@ -258,6 +358,8 @@ async function handlePut(request, env) {
     pushes: budget.pushes + 1,
     lastPushAt: new Date().toISOString(),
     lastBytes: bytes,
+    lastReceivedBytes: receivedBytes,
+    lastEncoding: gzipped ? 'gzip' : 'raw',
     total: budget.total + 1,
     gens,
   };
@@ -276,6 +378,8 @@ async function handlePut(request, env) {
     ok: true,
     generation: gen,
     bytes,
+    receivedBytes,
+    encoding: next.lastEncoding,
     pushesToday: next.pushes,
     dailyPushBudget: cap,
     pushesLeft: Math.max(0, cap - next.pushes),

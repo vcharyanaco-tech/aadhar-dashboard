@@ -2510,9 +2510,12 @@ def backup_tab():
                    f"pushes today {b.get('pushesToday')}/{b.get('dailyPushBudget')} "
                    f"({b.get('pushesLeft')} left) | {b.get('trackedGenerations')} generation(s) kept, "
                    f"oldest trimmed past {b.get('retain')}")
+    checkpoint = s.get("checkpoint_minutes") or 0
+    checkpoint_text = (f" A fresh checkpoint is uploaded at least every {checkpoint} minute(s) "
+                       "even when nothing changed." if checkpoint else "")
     st.caption(f"Automatic push every {s['interval_minutes']} minute(s), and never sooner than "
                f"{s['min_interval_minutes']} minute(s) after the last one. Writes that land inside that "
-               "window are pushed by the final push on shutdown.")
+               f"window are pushed by the final push on shutdown.{checkpoint_text}")
 
     if s["last_error"]:
         st.error(f"Last error: {s['last_error']}")
@@ -2526,6 +2529,9 @@ def backup_tab():
     if s["skipped_min_interval"]:
         st.info("The most recent push was held back by the minimum interval, not lost. It goes out on the "
                 "next scheduled push or on shutdown.")
+    if s.get("skipped_unchanged"):
+        st.caption(f"{s['skipped_unchanged']} check(s) skipped the upload because the database was unchanged. "
+                   f"Last local check: {_age_text(s.get('last_checked_age_seconds'))}.")
     if s["pending_changes"]:
         st.info(f"Changes are waiting to be pushed{_since_text(s['pending_since'])}.")
     if s["restored"] and s["restored_from"]:
@@ -2536,7 +2542,10 @@ def backup_tab():
         with st.spinner("Pushing a snapshot to the bridge..."):
             result = kv_sync.backup_data(force=True, reason="admin")
         _backup_status_cached.clear()
-        if result.get("backed_up"):
+        if result.get("skipped") == "unchanged":
+            st.info("The local database is unchanged, so the bridge already holds this "
+                    "snapshot. Nothing was uploaded.")
+        elif result.get("backed_up"):
             st.success(f"Pushed {result['bytes']:,} bytes as generation {result.get('generation')}.")
         else:
             st.error(f"Backup failed: {result.get('error') or result.get('reason')}")

@@ -1,6 +1,8 @@
 node_modules/
 dist/
 *.local
+# Local Aadhaar bridge credentials (never commit)
+.env.local
 *.tsbuildinfo
 .DS_Store
 .venv/

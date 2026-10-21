@@ -242,6 +242,11 @@ npx wrangler secret put BRIDGE_TOKEN   # must match AADHAR_SYNC_TOKEN on Render
 npx wrangler deploy
 ```
 
+On the local fallback machine, `.\backup-worker\deploy.ps1` loads the scoped
+Cloudflare credential from the gitignored `../.cloudflare.local` and refuses any
+account other than the Aadhaar backup account. `-DryRun` bundles without
+uploading. The credential file is never committed.
+
 Deploy the Worker before the Render service when possible. It accepts both raw
 and gzip PUTs, so an old client keeps working; if the order is reversed, the
 client's raw fallback keeps pushes working until the next restart.

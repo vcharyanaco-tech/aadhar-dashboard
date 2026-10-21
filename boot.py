@@ -27,6 +27,8 @@ def main():
     if result.get("restored"):
         print(f"[boot] restored aadhaar.db from the bridge "
               f"({result.get('bytes')} bytes, generation {result.get('generation')})", flush=True)
+    elif result.get("reason") == "local db exists":
+        print("[boot] using the existing local aadhaar.db (no restore needed)", flush=True)
     elif kv_sync.enabled():
         print(f"[boot] WARNING: aadhaar.db was NOT restored ({result.get('reason')}). "
               f"The app will start on an empty database and kv_sync will refuse to "

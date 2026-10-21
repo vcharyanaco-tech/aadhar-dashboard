@@ -498,24 +498,90 @@ def _refuse_orphan_replace(summary):
         f"Upload the complete master, or clear the existing transaction uploads first.")
 
 
-def replace_master(m, confirm_orphans=False):
+def plan_master_transfers(m, effective):
+    """Division / Sub Division changes between the saved master and the uploaded one.
+
+    Returns one dict per station whose Division or Sub Division differs, to be recorded
+    as a station transfer effective from `effective`, so reports for dates before it
+    keep the old Division. Stations that are new in the sheet have no history and are
+    not listed. Raises ValueError if a station already has a later transfer.
+    """
+    need = {"key", "division", "sub_division"}
+    if effective is None or not table_exists("master") or not need.issubset(m.columns):
+        return []
+    cur = read_sql("SELECT * FROM master")
+    if cur.empty or not need.issubset(cur.columns):
+        return []
+
+    def txt(v):
+        return "" if v is None or pd.isna(v) else str(v).strip()
+
+    cur = cur.assign(key=cur["key"].astype(str)).drop_duplicates("key", keep="last").set_index("key")
+    last = {str(r.key): r.last for r in read_sql(
+        "SELECT key, MAX(effective_date) AS last FROM station_transfers GROUP BY key").itertuples()}
+    eff = effective.strftime("%Y-%m-%d")
+    pending, blocked = [], []
+    for _, r in m.iterrows():
+        k = str(r["key"])
+        if k not in cur.index:
+            continue
+        o = cur.loc[k]
+        nd, ns = txt(r["division"]), txt(r["sub_division"])
+        if not nd:
+            continue
+        if (parsers.norm(txt(o["division"])) == parsers.norm(nd)
+                and parsers.norm(txt(o["sub_division"])) == parsers.norm(ns)):
+            continue
+        if last.get(k) and eff < last[k]:
+            blocked.append(f"{txt(r.get('station'))} (transfer already effective {last[k]})")
+            continue
+        pending.append({"key": k, "station": txt(r.get("station")) or txt(o.get("station")),
+                        "office_id": txt(r.get("office_id")) or txt(o.get("office_id")),
+                        "old_division": txt(o["division"]), "old_sub_division": txt(o["sub_division"]),
+                        "new_division": nd, "new_sub_division": ns, "effective_date": eff})
+    if blocked:
+        raise ValueError(f"{len(blocked)} station(s) already have a later Division transfer than "
+                         f"{effective.strftime('%d-%m-%Y')}, so nothing was saved. Use a later "
+                         f"effective date or undo that transfer first: " + "; ".join(blocked[:10]))
+    return pending
+
+
+def replace_master(m, confirm_orphans=False, effective_date=None):
     """Replace the master table, refusing by default if it would orphan history.
 
     Returns a summary dict. Set `confirm_orphans` to proceed despite the warning.
+    With `effective_date`, every station whose Division / Sub Division differs from the
+    saved master is recorded as a transfer from that date (see plan_master_transfers).
     """
+    pending = plan_master_transfers(m, effective_date)
     m, carried = carry_over_station_changes(m)
     if carried:
         audit("master.carry_over", f"{carried} station ID(s) from Station ID changes re-added to the new master")
-    m, moved = reapply_station_transfers(m)
+    m, moved = reapply_station_transfers(m, pending)
     if moved:
         audit("master.transfer_reapplied",
               f"{moved} transferred station(s) kept in their new Division / Sub Division")
     con = connect()
     try:
         summary = parsers.save_master(con, m, on_replace=None if confirm_orphans else _refuse_orphan_replace)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        by = st.session_state.get("user", {}).get("username", "system")
+        for p in pending:
+            con.execute(
+                "INSERT INTO station_transfers(key, station, office_id, old_division, old_sub_division,"
+                " new_division, new_sub_division, effective_date, changed_by, changed_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (p["key"], p["station"], p["office_id"], p["old_division"], p["old_sub_division"],
+                 p["new_division"], p["new_sub_division"], p["effective_date"], by, now))
         con.commit()
     finally:
         con.close()
+    summary["transfers"] = len(pending)
+    if pending:
+        audit("master.transfers", f"{len(pending)} station(s) changed Division / Sub Division, effective "
+              f"{effective_date.strftime('%d-%m-%Y')}: "
+              + "; ".join(f"{p['station']} {p['old_division']}/{p['old_sub_division']} -> "
+                          f"{p['new_division']}/{p['new_sub_division']}" for p in pending[:5]))
     clear_report_cache()
     audit("master.replace", f"{summary['incoming']} stations in, "
                             f"{summary['orphaned']} previously-seen key(s) orphaned"
@@ -538,7 +604,43 @@ def clear_report_cache():
             pass
 
 
+def keep_old_operators(m):
+    """Add back operators that are in the saved Operator master but not in the new sheet.
+
+    A new Operator master sheet used to replace the table completely, so an operator
+    missing from it lost his name in every report. Now the new sheet only adds or
+    updates operators; an operator already saved stays unless the new sheet has him
+    (then the new sheet's row wins). Returns (merged_master, rows_kept).
+    """
+    if not table_exists("operator_master"):
+        return m, 0
+    old = read_sql("SELECT * FROM operator_master")
+    if old.empty:
+        return m, 0
+    idcol = next((c for c in ("operator", "operator_id", "Operator ID", "key")
+                  if c in m.columns and c in old.columns), None)
+    if idcol is None:
+        common = [c for c in m.columns if c in old.columns]
+        if not common:
+            raise ValueError("Could not match the new Operator master with the saved one, "
+                             "so nothing was changed.")
+        idcol = common[0]
+
+    def norm(s):
+        return s.astype(str).str.strip().str.upper()
+
+    gone = old[~norm(old[idcol]).isin(set(norm(m[idcol])))]
+    if gone.empty:
+        return m, 0
+    extra = gone.reindex(columns=m.columns)
+    for c in extra.columns:
+        if extra[c].dtype == object:
+            extra[c] = extra[c].fillna("")
+    return pd.concat([m, extra], ignore_index=True), len(extra)
+
+
 def save_operator_master(m):
+    m, kept = keep_old_operators(m)
     con = connect()
     try:
         n = parsers.save_operator_master(con, m)
@@ -546,9 +648,10 @@ def save_operator_master(m):
     finally:
         con.close()
     clear_report_cache()
-    audit("operator_master.replace", f"{n} operators")
+    audit("operator_master.merge", f"{n} operators in total; {kept} earlier operator(s) "
+                                   "not in the new sheet were kept")
     kv_sync.request_backup()
-    return n
+    return n, kept
 
 
 def operator_names():
@@ -751,10 +854,16 @@ def apply_station_transfers(agg, missing, period_dates, transfers):
     return agg, missing
 
 
-def reapply_station_transfers(m):
-    """Keep transferred stations in their new Division / Sub Division after a master upload."""
+def reapply_station_transfers(m, extra=None):
+    """Keep transferred stations in their new Division / Sub Division after a master upload.
+
+    `extra` = transfers detected in this very upload (not saved yet); they count as the
+    newest transfer of their station, so the uploaded Division is kept, not undone.
+    """
     try:
         tr = read_sql("SELECT * FROM station_transfers ORDER BY id")
+        if extra:
+            tr = pd.concat([tr, pd.DataFrame(extra)], ignore_index=True)
         if tr.empty or not {"key", "division", "sub_division"}.issubset(m.columns):
             return m, 0
         latest = tr.drop_duplicates("key", keep="last").set_index("key")
@@ -848,6 +957,166 @@ def undo_station_transfer(transfer_id):
     audit("station.transfer_undo", f"{row['station']}: back to {row['old_division']}/{row['old_sub_division']}")
     kv_sync.request_backup()
     return True, "Station transfer undone."
+
+
+def _period_dates(ids):
+    marks = ",".join("?" * len(ids))
+    labels = run(f"SELECT label FROM uploads WHERE id IN ({marks})", tuple(ids), many=True)
+    return [parse_label_date(r["label"]) for r in labels]
+
+
+def adjust_ops_for_transfers(ops, ids):
+    """Operator rows under the Division / Sub Division the stations had on the report dates.
+
+    `ops` (from build_period) carries the CURRENT master placement. If the whole period
+    ends before a station's transfer date, an operator row whose label is that station's
+    new placement is moved back to its old one (the station where the operator did the
+    most transactions decides). Rows that become identical are merged. Periods with a
+    non-date upload label are left as they are.
+    """
+    try:
+        if ops is None or ops.empty:
+            return ops
+        tr = read_sql("SELECT * FROM station_transfers ORDER BY effective_date, id")
+        dates = _period_dates(ids)
+        if tr.empty or not dates or any(d is None for d in dates):
+            return ops
+        tr["_eff"] = pd.to_datetime(tr["effective_date"], errors="coerce").dt.date
+        future = tr[tr["_eff"].notna() & (tr["_eff"] > max(dates))]
+        if future.empty:
+            return ops
+        first = future.drop_duplicates("key", keep="first").set_index("key")
+        cols = {r["name"].lower(): r["name"] for r in run("PRAGMA table_info(tx)", many=True)}
+        op_col = next((cols[c] for c in ("operator", "operator_id", "session_operator_id") if c in cols), None)
+        if not op_col or "enr" not in cols or "upd" not in cols:
+            return ops
+        marks = ",".join("?" * len(ids))
+        kmarks = ",".join("?" * len(first))
+        ot = read_sql(
+            f'SELECT key, TRIM("{op_col}") AS op, SUM(COALESCE("{cols["enr"]}",0) + COALESCE("{cols["upd"]}",0))'
+            f' AS total FROM tx WHERE upload_id IN ({marks}) AND key IN ({kmarks})'
+            f' AND "{op_col}" IS NOT NULL AND TRIM("{op_col}") <> \'\' GROUP BY key, TRIM("{op_col}")',
+            tuple(ids) + tuple(first.index))
+        if ot.empty:
+            return ops
+        mm = read_sql("SELECT key, division, sub_division FROM master").drop_duplicates("key").set_index("key")
+        ot["op"] = ot["op"].astype(str).str.strip().str.upper()
+        ot["div_now"] = ot["key"].map(mm["division"])
+        ot["sub_now"] = ot["key"].map(mm["sub_division"])
+        ot["old_div"] = ot["key"].map(first["old_division"])
+        ot["old_sub"] = ot["key"].map(first["old_sub_division"])
+        o = ops.copy()
+        o["_op"] = o["operator"].astype(str).str.strip().str.upper()
+        hit = (o.reset_index(names="_i")[["_i", "_op", "division", "sub_division"]]
+               .merge(ot, left_on=["_op", "division", "sub_division"],
+                      right_on=["op", "div_now", "sub_now"])
+               .sort_values("total", ascending=False).drop_duplicates("_i"))
+        if hit.empty:
+            return ops
+        o.loc[hit["_i"].values, "division"] = hit["old_div"].values
+        o.loc[hit["_i"].values, "sub_division"] = hit["old_sub"].values
+        o = o.drop(columns="_op")
+        if o.duplicated(["operator", "division", "sub_division"]).any():
+            agg = {c: "sum" for c in ("stations", "enr", "mbu", "demo", "nonmbu", "upd", "total") if c in o.columns}
+            if "days_worked" in o.columns:
+                agg["days_worked"] = "max"
+            agg.update({c: "first" for c in o.columns
+                        if c not in agg and c not in ("operator", "division", "sub_division")})
+            o = o.groupby(["operator", "division", "sub_division"], as_index=False, sort=False).agg(agg)
+            o = o[[c for c in ops.columns if c in o.columns]]
+        return o.reset_index(drop=True)
+    except Exception as e:
+        st.warning(f"Station transfers could not be applied to the operator report: {e}")
+        return ops
+
+
+def placement_asof(df, key_col, date_col):
+    """Division / Sub Division of each row's station on that row's own date.
+
+    The master has today's placement; a row dated before a station's transfer date gets
+    the placement the station had then. Rows with a non-date label stay as they are.
+    """
+    try:
+        tr = read_sql("SELECT key, old_division, old_sub_division, effective_date FROM station_transfers"
+                      " ORDER BY effective_date, id")
+        if tr.empty or df.empty:
+            return df
+        by_key = {}
+        for r in tr.itertuples():
+            eff = pd.to_datetime(r.effective_date, errors="coerce")
+            if pd.notna(eff):
+                by_key.setdefault(str(r.key), []).append((eff.date(), r.old_division, r.old_sub_division))
+        if not by_key:
+            return df
+        df = df.copy()
+        divs, subs = df["division"].tolist(), df["sub_division"].tolist()
+        for i, (k, lab) in enumerate(zip(df[key_col].astype(str), df[date_col])):
+            lst = by_key.get(k)
+            d = parse_label_date(lab)
+            if not lst or d is None:
+                continue
+            for eff, od, os_ in lst:
+                if eff > d:
+                    divs[i], subs[i] = od, os_ or ""
+                    break
+        df["division"], df["sub_division"] = divs, subs
+        return df
+    except Exception:
+        return df
+
+
+def _norm_col(series):
+    return series.fillna("").astype(str).map(parsers.norm)
+
+
+def camp_moves():
+    """Sub Divisions that moved as a whole, from the recorded transfers.
+
+    A move counts only when no station is left in the old Division / Sub Division in the
+    master, so one office moving alone does not relabel the camps of its old Sub Division.
+    Returns [(effective_date, old_div, old_sub, new_div, new_sub)] oldest first.
+    """
+    try:
+        tr = read_sql("SELECT old_division, old_sub_division, new_division, new_sub_division,"
+                      " effective_date FROM station_transfers")
+        if tr.empty or not table_exists("master"):
+            return []
+        mm = read_sql("SELECT division, sub_division FROM master")
+        present = {(parsers.norm(d), parsers.norm(x))
+                   for d, x in zip(mm["division"].fillna(""), mm["sub_division"].fillna(""))}
+        moves = []
+        for r in tr.fillna("").drop_duplicates().itertuples():
+            eff = pd.to_datetime(r.effective_date, errors="coerce")
+            old = (parsers.norm(r.old_division), parsers.norm(r.old_sub_division))
+            if pd.isna(eff) or old == (parsers.norm(r.new_division), parsers.norm(r.new_sub_division)) \
+                    or old in present:
+                continue
+            moves.append((eff, r.old_division, r.old_sub_division, r.new_division, r.new_sub_division))
+        return sorted(moves, key=lambda x: x[0])
+    except Exception:
+        return []
+
+
+def relabel_camps(df, dates):
+    """Show camps under the Division / Sub Division in force on the camp date.
+
+    A camp dated before a moved Sub Division's transfer date is shown under its old
+    Division (even if it was entered under the new name later), a camp on or after that
+    date under the new one (even if entered under the old name). `dates` is a Series
+    aligned with df. MBU camps are not touched: their Division comes from the sheet.
+    """
+    moves = camp_moves()
+    if not moves or df.empty:
+        return df
+    df = df.copy()
+    d = pd.to_datetime(dates, errors="coerce")
+    for eff, od, os_, nd, ns in moves:
+        dv, sd = _norm_col(df["division"]), _norm_col(df["sub_division"])
+        to_old = (dv == parsers.norm(nd)) & (sd == parsers.norm(ns)) & (d < eff)
+        to_new = (dv == parsers.norm(od)) & (sd == parsers.norm(os_)) & (d >= eff)
+        df.loc[to_old, "division"], df.loc[to_old, "sub_division"] = od, os_
+        df.loc[to_new, "division"], df.loc[to_new, "sub_division"] = nd, ns
+    return df
 
 
 def station_transfer_form():
@@ -1308,6 +1577,7 @@ def operator_analysis_tab():
         return
 
     _, _, _, ops = build_period(ids)
+    ops = adjust_ops_for_transfers(ops, ids)
     if ops.empty:
         st.info("No operator data found for the selected period. Make sure the daily upload file has "
                 "a Session Operator ID (or Operator ID) column.")
@@ -1440,6 +1710,7 @@ def low_txn_operator_reports(ids, ops, dv):
     df["sub_division"] = df["sub_division"].fillna("")
     df["station"] = df["station"].fillna(df["key"])
     df["Operator Name"] = df["operator"].map(names).fillna("")
+    df = placement_asof(df, "key", "Date")  # each day under the Division the station had that day
     if dv != "All":
         df = df[df["division"] == dv]
     df = df.rename(columns={"operator": "Operator ID", "station": "Station ID", "address": "Machine Address",
@@ -1478,6 +1749,15 @@ def upload_tab():
         f = st.file_uploader("Master file", type=["xlsx", "xls", "csv"], key="master_uploader")
         if f is not None:
             st.caption(f"Selected file: **{f.name}** ({f.size / 1024:.1f} KB) - ready to save.")
+        use_eff = st.checkbox("Division / Sub Division changes in this sheet take effect from a date "
+                              "(reports for earlier dates keep the old Division)", value=True,
+                              key="master_use_eff")
+        eff_master = st.date_input("Effective date of the changes", value=datetime.now().date(),
+                                   format="DD-MM-YYYY", key="master_eff")
+        st.caption("Every station whose Division or Sub Division differs from the saved master is "
+                   "recorded as a transfer from this date and appears in the transfer list below "
+                   "(where it can be undone). Untick the box only to correct a wrong name, which then "
+                   "applies to all dates.")
         if st.session_state.get("master_orphan_warning"):
             st.warning(st.session_state["master_orphan_warning"])
             force_master = st.checkbox(
@@ -1492,9 +1772,13 @@ def upload_tab():
             else:
                 try:
                     mm = read_file(f, parse_master)
-                    replace_master(mm, confirm_orphans=force_master)
+                    res = replace_master(mm, confirm_orphans=force_master,
+                                         effective_date=eff_master if use_eff else None)
                     st.session_state.pop("master_orphan_warning", None)
-                    flash(f"Master saved: {len(mm)} stations.")
+                    n_tr = res.get("transfers", 0)
+                    flash(f"Master saved: {len(mm)} stations."
+                          + (f" {n_tr} station(s) changed Division / Sub Division, effective "
+                             f"{eff_master.strftime('%d-%m-%Y')}." if n_tr else ""))
                 except ValueError as e:
                     # Distinguish "this file is unparseable" from "this file would
                     # destroy history"; only the latter can be acknowledged.
@@ -1510,8 +1794,9 @@ def upload_tab():
 
     st.subheader("Operator master")
     st.caption("Headers: Operator ID, Operator Name (other columns are ignored). The Operator ID must match the "
-               "Session Operator ID in the daily transaction sheet. A new upload replaces the existing "
-               "operator master, so upload the complete list each time.")
+               "Session Operator ID in the daily transaction sheet. A new upload is merged into the "
+               "existing operator master: operators in the sheet are added or updated, and operators "
+               "that are not in the sheet are kept, so their names stay in the reports.")
     if table_exists("operator_master"):
         n_om = run("SELECT COUNT(*) AS n FROM operator_master", one=True)["n"]
         st.caption(f"Currently saved: **{n_om}** operators.")
@@ -1527,8 +1812,10 @@ def upload_tab():
             else:
                 try:
                     om = read_file(fo, parse_operator_master)
-                    save_operator_master(om)
-                    flash(f"Operator master saved: {len(om)} operators.")
+                    total, kept = save_operator_master(om)
+                    flash(f"Operator master saved: {len(om)} operators in the sheet, "
+                          f"{kept} earlier operator(s) not in the sheet were kept. "
+                          f"Total now: {total}.")
                 except Exception as e:
                     st.error(str(e))
 
@@ -2620,7 +2907,14 @@ def mbu_camps_section():
     months = sorted({x for ms in df["_months"] for x in ms}, reverse=True)  # latest month first = the default view
 
     f1, f2, f3 = st.columns(3)
-    month = f1.selectbox("Month", months + ["ALL"], format_func=_month_label, key="mbu_month")
+    # Default = the current calendar month (e.g. October 2026 while it is October 2026);
+    # if that month has no camps, the nearest earlier month, else the latest one. Every
+    # other month stays selectable.
+    _cur = date.today().strftime("%Y-%m")
+    _default_month = _cur if _cur in months else next((x for x in months if x <= _cur), months[0])
+    month_opts = months + ["ALL"]
+    month = f1.selectbox("Month", month_opts, index=month_opts.index(_default_month),
+                         format_func=_month_label, key="mbu_month")
     dv = f2.selectbox("Division", ["All"] + sorted(df["division"].unique()), key="mbu_div")
     status = f3.selectbox("Status", ["All", "Pending (not entered)", "Entered"], key="mbu_status")
     pool = df if month == "ALL" else df[df["_months"].map(lambda ms: month in ms)]
@@ -2764,11 +3058,12 @@ def consolidated_camp_report():
     st.divider()
     st.subheader("Consolidated Division-wise camp report")
 
-    gen = read_sql("SELECT camp_date, division, transactions FROM camps") if table_exists("camps") \
-        else pd.DataFrame(columns=["camp_date", "division", "transactions"])
+    gen = read_sql("SELECT camp_date, division, sub_division, transactions FROM camps") if table_exists("camps") \
+        else pd.DataFrame(columns=["camp_date", "division", "sub_division", "transactions"])
     mbu = read_sql("SELECT camp_date, division, transactions FROM mbu_camps") if table_exists("mbu_camps") \
         else pd.DataFrame(columns=["camp_date", "division", "transactions"])
     gen["_d"] = pd.to_datetime(gen["camp_date"], format="%d-%m-%Y", errors="coerce").dt.date
+    gen = relabel_camps(gen, gen["_d"])  # Division as on the camp date
     mbu["_d"] = pd.to_datetime(mbu["camp_date"], format="%Y-%m-%d", errors="coerce").dt.date
     for df in (gen, mbu):
         df["transactions"] = pd.to_numeric(df["transactions"], errors="coerce")
@@ -2840,6 +3135,7 @@ def general_camps_section():
         return
     camps = read_sql("SELECT * FROM camps ORDER BY id DESC")
     camps["_d"] = pd.to_datetime(camps["camp_date"], format="%d-%m-%Y", errors="coerce")
+    camps = relabel_camps(camps, camps["_d"])  # Division / Sub Division as on the camp date
 
     f1, f2, f3 = st.columns([1, 1, 2])
     dv = f1.selectbox("Division", ["All"] + sorted(camps["division"].unique()), key="camp_rep_dv")

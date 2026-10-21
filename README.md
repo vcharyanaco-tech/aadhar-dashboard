@@ -300,9 +300,10 @@ holding no backups at all.
 `boot.py` overrides CORS and the upload size on the command line, and the flag
 wins, so the effective production values come from `boot.py`.
 
-There is no Cloudflare proxy in front of this service today. The dash-site Worker
-has no `/aadhar-dashboard/*` route and no `AADHAR_ORIGIN` binding, so the Render
-URL is the public entry point.
+The public URL is proxied by the dash-site Worker under `/aadhar-dashboard/*`
+using its `AADHAR_ORIGIN` secret. Normally that points at the Render URL; while
+Render is suspended it points at a local Cloudflare quick tunnel. The base path
+and WebSocket configuration are unchanged.
 
 #### The keep-alive Worker
 

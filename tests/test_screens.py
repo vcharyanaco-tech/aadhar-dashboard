@@ -88,6 +88,27 @@ def seeded(env):
     return db
 
 
+@pytest.fixture()
+def mbu_seeded(seeded):
+    """A master and one pending MBU camp, so the data editor has a row."""
+    con = sqlite3.connect(seeded)
+    con.execute("CREATE TABLE IF NOT EXISTS mbu_camp_batches(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " filename TEXT, uploaded_by TEXT, uploaded_at TEXT, rows_in_file INTEGER,"
+                " rows_added INTEGER DEFAULT 0)")
+    con.execute("CREATE TABLE IF NOT EXISTS mbu_camps(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " batch_id INTEGER, camp_date TEXT, division TEXT, district TEXT, location TEXT,"
+                " transactions INTEGER, remarks TEXT, dedupe_key TEXT UNIQUE, created_by TEXT,"
+                " created_at TEXT, updated_by TEXT, updated_at TEXT, camp_end_date TEXT)")
+    con.execute("INSERT INTO mbu_camp_batches(filename, uploaded_by, uploaded_at, rows_in_file, rows_added)"
+                " VALUES ('october.xlsx', 'admin', '2026-10-01 10:00', 1, 1)")
+    con.execute("INSERT INTO mbu_camps(batch_id, camp_date, division, district, location, dedupe_key,"
+                " created_by, created_at) VALUES (1, '2026-10-15', 'Hisar', 'Hisar',"
+                " 'Test School', 'test-key', 'admin', '2026-10-01 10:00')")
+    con.commit()
+    con.close()
+    return seeded
+
+
 # ---------------------------------------------------------------- module hygiene
 class TestPerformanceGuards:
     """Guards against work that is cheap locally and expensive on the live host.
@@ -131,6 +152,37 @@ class TestPerformanceGuards:
         for fn in ("replace_master", "save_operator_master", "save_tx"):
             body = src.split(f"def {fn}")[1].split("\ndef ")[0]
             assert "clear_report_cache()" in body, f"{fn} must invalidate the report cache"
+
+    def test_interactive_pages_are_fragments(self):
+        """Widget changes on these pages must not rerun the sidebar, login and
+        every other page function."""
+        import re
+        src = self._source()
+        for fn in ("dashboard", "operator_analysis_tab", "report_tab", "camps_tab", "backup_tab"):
+            assert re.search(rf"@st\.fragment\s*\ndef {fn}\(", src), \
+                f"{fn} must be a Streamlit fragment"
+
+    def test_schema_setup_is_cached(self):
+        src = self._source()
+        assert "@st.cache_resource" in src
+        assert "def _init_db_cached(db_path)" in src
+        assert "_init_db_cached(str(DB))" in src
+
+    def test_the_seven_day_chart_is_cached_by_uploads_and_filters(self):
+        src = self._source()
+        assert "def _last7_division_totals_cached(upload_key" in src
+        assert "_last7_division_totals_cached(upload_key, dv, ds)" in src
+        assert '"_last7_division_totals_cached"' in src.split("def clear_report_cache")[1]
+
+    def test_mbu_editor_is_batched_in_a_form(self):
+        """A data editor outside a form reruns the page on every cell edit."""
+        src = self._source()
+        body = src.split("def mbu_camps_section(")[1].split("\ndef ")[0]
+        form_at = body.index("with st.form(")
+        editor_at = body.index("st.data_editor(")
+        submit_at = body.index('st.form_submit_button("Save entries"')
+        assert form_at < editor_at < submit_at
+        assert 'st.button("Save entries"' not in body
 
 
 class TestCorsIsLeftOff:
@@ -245,6 +297,16 @@ class TestScreensRender:
         assert "Manage users" not in nav
         assert "Backup status" not in nav
         assert "Dashboard" in nav
+
+
+class TestMbuEditor:
+    def test_mbu_editor_renders_inside_a_save_form(self, mbu_seeded):
+        at = _nav(_login("admin", "adminpass"), "Camps")
+        camps_tab = next(r for r in at.radio if r.label == "Camps")
+        camps_tab.set_value("MBU Camps").run()
+        assert not at.exception, at.exception
+        assert any("Enter transactions" in s.value for s in at.subheader)
+        assert any(b.label == "Save entries" for b in at.button)
 
 
 # ---------------------------------------------------------------- role gating

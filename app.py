@@ -166,7 +166,14 @@ def table_exists(name):
     return run("SELECT 1 FROM sqlite_master WHERE name=?", (name,), one=True) is not None
 
 
-def init_db():
+@st.cache_resource(show_spinner=False)
+def _init_db_cached(db_path):
+    """Create the schema once per process, not once per Streamlit rerun.
+
+    The DDL is cheap on a workstation but every interaction used to pay for it
+    on the throttled free instance. `db_path` is part of the cache key so tests
+    (and a restored database) do not reuse the schema check from another file.
+    """
     run("""CREATE TABLE IF NOT EXISTS users(
         username TEXT PRIMARY KEY, salt TEXT, pw_hash TEXT, role TEXT,
         active INTEGER DEFAULT 1, fails INTEGER DEFAULT 0, locked_until TEXT, created_at TEXT,
@@ -219,6 +226,11 @@ def init_db():
     finally:
         con.close()
     seed_division_targets()
+
+
+def init_db():
+    """Wrapper kept as the public entry point used by the app and tests."""
+    _init_db_cached(str(DB))
 
 
 def seed_division_targets():
@@ -597,7 +609,8 @@ def clear_report_cache():
     deliberately do not clear this. The TTL is a safety net, not the mechanism:
     an admin uploading a sheet should see it immediately, not after five minutes.
     """
-    for name in ("build_period", "machine_address_map", "station_operator_map"):
+    for name in ("build_period", "machine_address_map", "station_operator_map",
+                 "_last7_division_totals_cached"):
         try:
             globals()[name].clear()
         except Exception:
@@ -1390,20 +1403,19 @@ def sidebar(page_names):
     return page
 
 
-def last7_division_totals(uploads, dv="All", ds="All"):
-    """Total transactions per day per Division for the 7 calendar days ending at
-    the latest uploaded date. Each day is built from its own upload(s) through
-    build_period_adj, so station ID changes and Division transfers are applied
-    exactly as in the rest of the dashboard.
+@st.cache_data(ttl=300, max_entries=16, show_spinner=False)
+def _last7_division_totals_cached(upload_key, dv="All", ds="All"):
+    """The 7-day chart is the expensive part of a dashboard filter rerun.
 
-    Returns (rows_df, day_labels). A day with no upload (e.g. a Sunday) has no
-    rows but stays in day_labels so the gap is visible on the chart.
+    It walks seven daily aggregates (and their station-transfer adjustments)
+    even when only Division/Sub Division changed. Cache it by the selected
+    uploads and filters, and clear it with the other report caches on writes.
     """
     dated = {}
-    for r in uploads:
-        d = parse_label_date(r["label"])
+    for uid, label in upload_key:
+        d = parse_label_date(label)
         if d is not None:
-            dated.setdefault(d, []).append(r["id"])
+            dated.setdefault(d, []).append(uid)
     if not dated:
         return pd.DataFrame(columns=["Day", "Division", "Transactions"]), []
     end = max(dated)
@@ -1422,6 +1434,19 @@ def last7_division_totals(uploads, dv="All", ds="All"):
         for division, total in a.groupby("division")["total"].sum().items():
             rows.append({"Day": lab, "Division": division, "Transactions": int(total)})
     return pd.DataFrame(rows, columns=["Day", "Division", "Transactions"]), labels
+
+
+def last7_division_totals(uploads, dv="All", ds="All"):
+    """Total transactions per day per Division for the 7 calendar days ending at
+    the latest uploaded date. The cached worker above does the per-day
+    build_period_adj calls; this wrapper turns the sqlite rows into a stable
+    cache key.
+
+    Returns (rows_df, day_labels). A day with no upload (e.g. a Sunday) has no
+    rows but stays in day_labels so the gap is visible on the chart.
+    """
+    upload_key = tuple((r["id"], r["label"]) for r in uploads)
+    return _last7_division_totals_cached(upload_key, dv, ds)
 
 
 def last7_chart(uploads, dv="All", ds="All"):
@@ -1455,6 +1480,7 @@ def last7_chart(uploads, dv="All", ds="All"):
                            "last7_days_division_transactions.csv", "text/csv", key="dl_last7")
 
 
+@st.fragment
 def dashboard():
     uploads = run("SELECT * FROM uploads ORDER BY id DESC", many=True)
     if not table_exists("master") or not uploads:
@@ -1566,6 +1592,7 @@ def dashboard():
                        "haryana_aadhaar_transactions.csv", "text/csv")
 
 
+@st.fragment
 def operator_analysis_tab():
     uploads = run("SELECT * FROM uploads ORDER BY id DESC", many=True)
     if not table_exists("master") or not uploads:
@@ -2200,6 +2227,7 @@ def station_status_counts(agg, missing, by):
     return c[by + STATION_COLS]
 
 
+@st.fragment
 def report_tab():
     uploads = run("SELECT * FROM uploads ORDER BY id DESC", many=True)
     if not table_exists("master") or not uploads:
@@ -2466,12 +2494,14 @@ def _rollback_controls(gens):
         if result.get("restored"):
             audit("backup.rollback", f"generation {gen} ({result['bytes']:,} bytes)")
             clear_report_cache()
+            _init_db_cached.clear()  # a restored snapshot may predate the current schema
             st.success(f"Restored {result['bytes']:,} bytes from generation {gen}.")
             st.rerun()
         else:
             st.error(f"Rollback failed: {result.get('reason')}")
 
 
+@st.fragment
 def backup_tab():
     """Admin view of whether the off-site backup is actually working.
 
@@ -2975,45 +3005,50 @@ def mbu_camps_section():
         g["remarks"] = g["remarks"].where(g["remarks"].isin(_ZERO_REASONS), None).astype(object)
         g.columns = ["Division", "District", "Camp Location", "Camp Date", _MBU_TXN, _MBU_REM]
         ver = st.session_state.get("mbu_ver", 0)  # new key after a save, so stale edits are not replayed
-        edited = st.data_editor(
-            g, hide_index=True, use_container_width=True, num_rows="fixed",
-            disabled=["Division", "District", "Camp Location", "Camp Date"],
-            column_config={_MBU_TXN: st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
-                           _MBU_REM: st.column_config.SelectboxColumn(options=_ZERO_REASONS, required=False)},
-            key=f"mbu_grid_{ver}_{month}_{dv}_{status}")
+        # A data editor outside a form reruns the whole page on every cell edit.
+        # The form batches all edits and pays for one rerun when Save is pressed.
+        with st.form(f"mbu_entry_form_{ver}_{month}_{dv}_{status}"):
+            edited = st.data_editor(
+                g, hide_index=True, use_container_width=True, num_rows="fixed",
+                disabled=["Division", "District", "Camp Location", "Camp Date"],
+                column_config={_MBU_TXN: st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
+                               _MBU_REM: st.column_config.SelectboxColumn(options=_ZERO_REASONS, required=False)},
+                key=f"mbu_grid_{ver}_{month}_{dv}_{status}")
+            save_entries = st.form_submit_button("Save entries", type="primary")
 
-        changes, bad, bad_rem = {}, [], []
-        for cid in g.index:
-            o_t = None if pd.isna(g.at[cid, _MBU_TXN]) else int(g.at[cid, _MBU_TXN])
-            o_raw = g.at[cid, _MBU_REM]
-            o_r = "" if o_raw is None or pd.isna(o_raw) else str(o_raw).strip()
-            raw_t, raw_r = edited.at[cid, _MBU_TXN], edited.at[cid, _MBU_REM]
-            n_r = "" if raw_r is None or pd.isna(raw_r) else str(raw_r).strip()
-            if raw_t is None or pd.isna(raw_t):
-                n_t = None
-            elif float(raw_t) != int(raw_t) or float(raw_t) < 0:
-                bad.append(f"{g.at[cid, 'Camp Location']} ({g.at[cid, 'Camp Date']})")
-                continue
-            else:
-                n_t = int(raw_t)
-            if (o_t, o_r) != (n_t, n_r):
-                if n_r == "" and n_t != 0 and int(cid) in legacy:
-                    n_r = legacy[int(cid)]  # an older free-text remark is not wiped by editing the figure
-                why = _mbu_remark_problem(n_t, n_r)
-                if why:
-                    bad_rem.append(f"{g.at[cid, 'Camp Location']} ({g.at[cid, 'Camp Date']}) {why}")
+        if save_entries:
+            changes, bad, bad_rem = {}, [], []
+            for cid in g.index:
+                o_t = None if pd.isna(g.at[cid, _MBU_TXN]) else int(g.at[cid, _MBU_TXN])
+                o_raw = g.at[cid, _MBU_REM]
+                o_r = "" if o_raw is None or pd.isna(o_raw) else str(o_raw).strip()
+                raw_t, raw_r = edited.at[cid, _MBU_TXN], edited.at[cid, _MBU_REM]
+                n_r = "" if raw_r is None or pd.isna(raw_r) else str(raw_r).strip()
+                if raw_t is None or pd.isna(raw_t):
+                    n_t = None
+                elif float(raw_t) != int(raw_t) or float(raw_t) < 0:
+                    bad.append(f"{g.at[cid, 'Camp Location']} ({g.at[cid, 'Camp Date']})")
                     continue
-                changes[int(cid)] = (n_t, n_r)
-        if bad:
-            st.error("Number of Transactions must be a whole number, 0 or more: " + "; ".join(bad))
-        if bad_rem:
-            st.error("Remarks not accepted - fix these rows before saving:\n\n- " + "\n- ".join(bad_rem))
-        st.caption(f"{len(changes)} row(s) changed." if changes else "No unsaved changes.")
-        if st.button("Save entries", type="primary", disabled=not changes or bool(bad) or bool(bad_rem),
-                     key="mbu_save"):
-            n = update_mbu_entries(changes, st.session_state["user"]["username"])
-            st.session_state["mbu_ver"] = ver + 1
-            flash(f"{n} MBU camp entr{'y' if n == 1 else 'ies'} saved.")
+                else:
+                    n_t = int(raw_t)
+                if (o_t, o_r) != (n_t, n_r):
+                    if n_r == "" and n_t != 0 and int(cid) in legacy:
+                        n_r = legacy[int(cid)]  # an older free-text remark is not wiped by editing the figure
+                    why = _mbu_remark_problem(n_t, n_r)
+                    if why:
+                        bad_rem.append(f"{g.at[cid, 'Camp Location']} ({g.at[cid, 'Camp Date']}) {why}")
+                        continue
+                    changes[int(cid)] = (n_t, n_r)
+            if bad:
+                st.error("Number of Transactions must be a whole number, 0 or more: " + "; ".join(bad))
+            if bad_rem:
+                st.error("Remarks not accepted - fix these rows before saving:\n\n- " + "\n- ".join(bad_rem))
+            if not changes:
+                st.info("No changes to save.")
+            elif not bad and not bad_rem:
+                n = update_mbu_entries(changes, st.session_state["user"]["username"])
+                st.session_state["mbu_ver"] = ver + 1
+                flash(f"{n} MBU camp entr{'y' if n == 1 else 'ies'} saved.")
 
     # ---- read-only report for everyone
     st.divider()
@@ -3131,6 +3166,7 @@ def consolidated_camp_report():
         excel_download(out, "Consolidated", "aadhaar_camp_consolidated_division_report.xlsx", "Download Excel")
 
 
+@st.fragment
 def camps_tab():
     section = st.radio("Camps", ["Camps", "MBU Camps"], horizontal=True, key="camps_section",
                        label_visibility="collapsed")

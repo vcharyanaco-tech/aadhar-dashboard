@@ -224,6 +224,37 @@ do that; **Starter ($7/month) is still 512 MB and would not fix an OOM.**
 Changing plans is a deliberate cost decision, so it is not part of this
 configuration.
 
+### Interaction performance
+
+Streamlit still re-executes code on every interaction; that is its execution
+model. The app therefore narrows and batches the reruns it can:
+
+- Dashboard, Operator Analysis, Report, Camps and Backup are `@st.fragment`s.
+  A filter change inside one of them no longer re-runs the sidebar, login check
+  or the other page functions.
+- The MBU data editor is inside a form. Cell edits stay in the browser until
+  **Save entries**, instead of causing a page rerun per keystroke.
+- `init_db()` is a `@st.cache_resource` keyed by the database path, so its
+  `CREATE TABLE IF NOT EXISTS` and index checks run once per process, not once
+  per click.
+- The seven-day Division chart is `@st.cache_data` keyed by the selected uploads
+  and Division/Sub Division filters. It is cleared with the other report caches
+  whenever master, transactions or transfers change.
+
+Measured on 2026-10-22 against a copy of the 5.9 MB production database, using
+the same Chrome browser and local Streamlit server for both versions:
+
+| Interaction | Before | After |
+|---|---:|---:|
+| Dashboard fragment body (server render) | ~330 ms | ~195 ms |
+| Division filter, browser-visible update | ~164 ms | ~136 ms |
+| MBU cell edit | one full rerun per edit | no rerun until Save |
+
+The browser figures are medians of nine alternating Division selections. The
+absolute times will be higher on Render's throttled CPU, but the ratio is the
+part that carries over. Fragments do not make Streamlit rerun-free: page
+navigation and writes still re-run more than a fragment does.
+
 ### Surviving the free plan's lack of a disk
 
 This service has **no persistent disk**, because Render only offers disks on paid

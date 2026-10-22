@@ -1331,6 +1331,22 @@ LOGIN_CSS = """<style>
 </style>"""
 
 
+# Streamlit's client dims the previous DOM to 33% opacity for 1.5 seconds on
+# every rerun (the `stale` state), then swaps in a skeleton while the next
+# fragment renders. On the shared free instance that reads as a slow fade plus
+# an ugly loading flash even when the server render is only a few hundred ms.
+# Keep old content at full opacity, hide the transient chrome, and remove the
+# remaining CSS transitions. Explicit st.spinner feedback for long backup
+# operations stays visible. This does not change any server-side work.
+NO_ANIMATION_CSS = """<style>
+[data-stale="true"]{opacity:1!important;transition:none!important}
+[data-testid="stStatusWidget"]{display:none!important}
+[data-testid="stSkeleton"]{display:none!important}
+html{scroll-behavior:auto!important}
+*,*::before,*::after{transition:none!important}
+</style>"""
+
+
 def login_screen():
     st.markdown(LOGIN_CSS, unsafe_allow_html=True)
     plate = ""
@@ -3254,6 +3270,9 @@ def general_camps_section():
 
 
 # ---------------------------------------------------------------- main
+# Put this before the login/setup screens so the same no-fade policy applies
+# while signed out and signed in.
+st.markdown(NO_ANIMATION_CSS, unsafe_allow_html=True)
 init_db()
 if "flash" in st.session_state:
     st.success(st.session_state.pop("flash"))

@@ -234,6 +234,10 @@ model. The app therefore narrows and batches the reruns it can:
   or the other page functions.
 - The MBU data editor is inside a form. Cell edits stay in the browser until
   **Save entries**, instead of causing a page rerun per keystroke.
+- The client no longer draws Streamlit's rerun transition: stale content stays
+  at full opacity, and the transient status/skeleton chrome is hidden. This is
+  a CSS-only fix for the 1.5-second fade that made fast fragment renders still
+  feel slow. Long backup operations still show their own explicit spinner text.
 - `init_db()` is a `@st.cache_resource` keyed by the database path, so its
   `CREATE TABLE IF NOT EXISTS` and index checks run once per process, not once
   per click.
@@ -252,8 +256,11 @@ the same Chrome browser and local Streamlit server for both versions:
 
 The browser figures are medians of nine alternating Division selections. The
 absolute times will be higher on Render's throttled CPU, but the ratio is the
-part that carries over. Fragments do not make Streamlit rerun-free: page
-navigation and writes still re-run more than a fragment does.
+part that carries over. Separately, Streamlit's 33%-opacity, 1.5-second stale
+fade and loading skeleton are disabled, so a rerun no longer looks slow even
+when the server render is only a few hundred milliseconds. Fragments do not
+make Streamlit rerun-free: page navigation and writes still re-run more than a
+fragment does.
 
 ### Surviving the free plan's lack of a disk
 

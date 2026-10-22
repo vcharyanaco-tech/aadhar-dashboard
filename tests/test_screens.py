@@ -174,6 +174,18 @@ class TestPerformanceGuards:
         assert "_last7_division_totals_cached(upload_key, dv, ds)" in src
         assert '"_last7_division_totals_cached"' in src.split("def clear_report_cache")[1]
 
+    def test_rerun_fade_and_loading_chrome_are_disabled(self):
+        """Streamlit fades stale content to 33% for 1.5 s on every rerun. On a
+        shared free instance that reads as lag even when the fragment render is
+        fast, so the client-side fade/skeleton must stay overridden."""
+        src = self._source()
+        assert 'NO_ANIMATION_CSS' in src
+        assert '[data-stale="true"]' in src
+        assert 'opacity:1!important' in src
+        assert 'stStatusWidget' in src
+        assert 'stSkeleton' in src
+        assert 'transition:none!important' in src
+
     def test_mbu_editor_is_batched_in_a_form(self):
         """A data editor outside a form reruns the page on every cell edit."""
         src = self._source()

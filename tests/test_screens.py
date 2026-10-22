@@ -182,7 +182,7 @@ class TestPerformanceGuards:
         assert 'NO_ANIMATION_CSS' in src
         assert '[data-stale="true"]' in src
         assert 'opacity:1!important' in src
-        assert 'stStatusWidget' in src
+        assert 'stStatusWidgetRunningIcon' in src
         assert 'stSkeleton' in src
         assert 'transition:none!important' in src
 

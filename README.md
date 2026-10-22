@@ -235,9 +235,10 @@ model. The app therefore narrows and batches the reruns it can:
 - The MBU data editor is inside a form. Cell edits stay in the browser until
   **Save entries**, instead of causing a page rerun per keystroke.
 - The client no longer draws Streamlit's rerun transition: stale content stays
-  at full opacity, and the transient status/skeleton chrome is hidden. This is
-  a CSS-only fix for the 1.5-second fade that made fast fragment renders still
-  feel slow. Long backup operations still show their own explicit spinner text.
+  at full opacity, the animated running indicator and loading skeleton are
+  hidden, and the Stop control remains available. This is a CSS-only fix for
+  the 1.5-second fade that made fast fragment renders still feel slow. Long
+  backup operations still show their own explicit spinner text.
 - `init_db()` is a `@st.cache_resource` keyed by the database path, so its
   `CREATE TABLE IF NOT EXISTS` and index checks run once per process, not once
   per click.

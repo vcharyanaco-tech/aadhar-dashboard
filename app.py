@@ -1336,11 +1336,12 @@ LOGIN_CSS = """<style>
 # fragment renders. On the shared free instance that reads as a slow fade plus
 # an ugly loading flash even when the server render is only a few hundred ms.
 # Keep old content at full opacity, hide the transient chrome, and remove the
-# remaining CSS transitions. Explicit st.spinner feedback for long backup
-# operations stays visible. This does not change any server-side work.
+# remaining CSS transitions. The status widget's Stop control stays available;
+# only its animated running icon is hidden. Explicit st.spinner feedback for
+# long backup operations also stays visible. This changes no server-side work.
 NO_ANIMATION_CSS = """<style>
 [data-stale="true"]{opacity:1!important;transition:none!important}
-[data-testid="stStatusWidget"]{display:none!important}
+[data-testid="stStatusWidgetRunningIcon"]{display:none!important}
 [data-testid="stSkeleton"]{display:none!important}
 html{scroll-behavior:auto!important}
 *,*::before,*::after{transition:none!important}

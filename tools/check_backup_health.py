@@ -26,8 +26,9 @@ MAX_SNAPSHOT_AGE_SECONDS = 26 * 3600
 def get(url, token, timeout=30, expect_json=True):
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-    return json.loads(body) if expect_json else body
+        raw = resp.read()
+    # /db returns the SQLite file itself, not text. Decode only for JSON routes.
+    return json.loads(raw.decode("utf-8")) if expect_json else raw
 
 
 def main(argv):

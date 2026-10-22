@@ -15,6 +15,22 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.14.3"
+      # Keep the process inside the 512 MB free-instance limit. Multiple glibc
+      # malloc arenas and BLAS/OpenMP thread pools hold memory that pandas and
+      # Streamlit never use on a 0.1-CPU instance; cap them instead of letting
+      # each library size itself for the host.
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      - key: MALLOC_TRIM_THRESHOLD_
+        value: "65536"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: NUMEXPR_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
       # No admin credentials here: the first-run setup screen creates the admin
       # in the database. ADMIN_USERNAME / ADMIN_PASSWORD are not read by the code.
       #

@@ -93,7 +93,7 @@ LOGO = next((p for n in ("logo.webp", "logo.png", "logo.jpg", "logo.jpeg")
              if (p := Path(__file__).parent / n).exists()), None)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(max_entries=1, show_spinner=False)
 def _encode_logo(path_str, stamp):
     """Encode the logo once. `stamp` is part of the cache key, so replacing
     logo.png invalidates it without needing a manual cache clear."""
@@ -252,7 +252,7 @@ def daily_targets():
     return merged
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=60, max_entries=1, show_spinner=False)
 def _target_lookup_cached():
     """Cached so the lookup is not rebuilt from a table read on every render."""
     return target_lookup()
@@ -2079,7 +2079,7 @@ OPERATOR_EMPTY_COLS = ["operator", "operator_name", "division", "sub_division", 
                        "days_worked", "enr", "mbu", "demo", "nonmbu", "upd", "total"]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, max_entries=8, show_spinner=False)
 def build_period(ids):
     """Cached wrapper around parsers.aggregate_period.
 
@@ -2095,7 +2095,7 @@ def build_period(ids):
         con.close()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, max_entries=8, show_spinner=False)
 def machine_address_map(ids):
     """key -> machine address, taken from the MASTER sheet.
 
@@ -2147,7 +2147,7 @@ def machine_address_map(ids):
     return daily
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=300, max_entries=8, show_spinner=False)
 def station_operator_map(ids):
     """key -> list of operator IDs who worked that station in the selected uploads.
 
@@ -2416,7 +2416,7 @@ def excel_download(df, sheet_name, filename, label, bold_last_row=True):
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=30, max_entries=1, show_spinner=False)
 def _backup_status_cached():
     return kv_sync.get_status()
 

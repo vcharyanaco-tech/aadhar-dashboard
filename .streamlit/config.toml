@@ -7,6 +7,10 @@ address = "0.0.0.0"
 # throttled free-plan CPU as the script run.
 fileWatcherType = "none"
 enableXsrfProtection = true
+# Free instances have 512 MB. A closed tab's session state and uploaded files
+# otherwise stay resident for two minutes; release them after 30 seconds so a
+# user opening a new tab does not leave the previous one holding memory.
+disconnectedSessionTTL = 30
 
 # CORS left off, as it was before. Turning it on with an explicit
 # corsAllowedOrigins allowlist was tried and took the app down: Streamlit's

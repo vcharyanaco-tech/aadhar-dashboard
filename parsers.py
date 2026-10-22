@@ -228,16 +228,38 @@ def parse_label_date(label):
 
 
 # ---------------------------------------------------------------- sheet readers
-def read_sheets(f):
-    """Load an uploaded Excel/CSV into {sheet_name: DataFrame}, all as strings.
+def iter_sheets(f):
+    """Yield an uploaded Excel/CSV's sheets one at a time, all as strings.
+
+    Reading a workbook with ``sheet_name=None`` materialises every sheet at
+    once. A 15 MB workbook with several sheets can then need several hundred MB,
+    which is enough to hit Render's 512 MB free-instance limit. The caller only
+    needs the first sheet that parses, so keep one sheet alive at a time and let
+    the ExcelFile close (and release its workbook) when iteration ends.
 
     Everything is read as text so the parsers control numeric coercion; letting
     pandas guess turns station numbers like '00123' into the integer 123 and
     loses the leading zeros the master sheet may rely on.
     """
     if str(getattr(f, "name", "")).lower().endswith(".csv"):
-        return {"CSV": pd.read_csv(f, dtype=str, keep_default_na=False)}
-    return pd.read_excel(f, dtype=str, keep_default_na=False, sheet_name=None)
+        yield "CSV", pd.read_csv(f, dtype=str, keep_default_na=False)
+        return
+
+    book = pd.ExcelFile(f)
+    try:
+        for name in book.sheet_names:
+            yield name, book.parse(name, dtype=str, keep_default_na=False)
+    finally:
+        book.close()
+
+
+def read_sheets(f):
+    """Load every sheet into a dict. Kept for callers that need all of them.
+
+    Prefer :func:`iter_sheets` when only the first usable sheet is needed; this
+    wrapper intentionally holds all sheets in memory at once.
+    """
+    return dict(iter_sheets(f))
 
 
 def parse_first_usable(f, parser):
@@ -247,7 +269,7 @@ def parse_first_usable(f, parser):
     upload attempt per sheet to diagnose.
     """
     errors = []
-    for name, df in read_sheets(f).items():
+    for name, df in iter_sheets(f):
         df = df.copy()
         df.columns = [str(c).strip() for c in df.columns]
         if df.empty:

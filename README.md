@@ -198,6 +198,32 @@ source of truth for its build, start, region and environment settings. Supply
 taking it from the repository, so it is never committed. Create the admin
 account through the first-run screen after the first deploy.
 
+### Memory on the free instance
+
+Render's free plan gives this service **512 MB of RAM**. Streamlit, pandas,
+pyarrow and plotly already use roughly 120 MB before a report is drawn, and a
+dashboard session takes that to about 200 MB. Several browser sessions, a large
+workbook, or a burst of report reruns can push the process over the limit. When
+that happens Render kills the instance and immediately starts a new one; the
+browser sees a 503 or a one- to two-minute wait, then the dashboard works
+again. That looks like a slow site, but it is not a routing or keepalive fault.
+
+`render.yaml` and the live service therefore set `MALLOC_ARENA_MAX=2`,
+`MALLOC_TRIM_THRESHOLD_=65536`, `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`,
+`NUMEXPR_NUM_THREADS=1` and `MKL_NUM_THREADS=1`. The report caches have a
+bounded number of entries, `.streamlit/config.toml` releases a disconnected
+session after 30 seconds instead of 120, and `parsers.iter_sheets` reads one
+Excel sheet at a time instead of materialising the whole workbook. These keep
+the working set well below the cap but cannot make 512 MB support unlimited
+concurrent users or arbitrarily large uploads.
+
+If `server_failed` events with `oomKilled.memoryLimit: 512Mi` continue under
+normal use, the reliable fix is a paid instance with more RAM. Render's
+**Starter Plus (1 GB, $15/month)** or **Standard (2 GB, $25/month)** plans both
+do that; **Starter ($7/month) is still 512 MB and would not fix an OOM.**
+Changing plans is a deliberate cost decision, so it is not part of this
+configuration.
+
 ### Surviving the free plan's lack of a disk
 
 This service has **no persistent disk**, because Render only offers disks on paid

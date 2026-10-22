@@ -1826,12 +1826,17 @@ def upload_tab():
     st.caption("Tip: if the file name itself contains the date (e.g. '22.09.2026.xlsx' or '22-09-2026.xlsx'), "
                "that date is picked up automatically and used as the label below - no need to type it. "
                "If no date is found in the file name, the label you type is used instead.")
-    with st.form("tx_form", clear_on_submit=True):
-        f = st.file_uploader("Transaction file", type=["xlsx", "xls", "csv"], key="tx_uploader")
+    # The form is reset only after a SUCCESSFUL save, by bumping this counter
+    # (it is part of the widget keys). clear_on_submit=True also wiped the chosen
+    # file after a FAILED save (duplicate label, wrong headers), so the very next
+    # click on "Save transactions" found no file and said "No file detected".
+    tx_n = st.session_state.get("tx_form_n", 0)
+    with st.form("tx_form"):
+        f = st.file_uploader("Transaction file", type=["xlsx", "xls", "csv"], key=f"tx_uploader_{tx_n}")
         if f is not None:
             st.caption(f"Selected file: **{f.name}** ({f.size / 1024:.1f} KB) - ready to save.")
         label = st.text_input("Date / period label (used only if the file name has no date)",
-                              value=datetime.now().strftime("%d-%m-%Y"))
+                              value=datetime.now().strftime("%d-%m-%Y"), key=f"tx_label_{tx_n}")
         if st.form_submit_button("Save transactions"):
             if not f and not label.strip():
                 st.warning("Enter a period label and choose a file.")
@@ -1851,6 +1856,7 @@ def upload_tab():
                     try:
                         tt = read_file(f, parse_tx)
                         save_tx(tt, final_label, st.session_state["user"]["username"])
+                        st.session_state["tx_form_n"] = tx_n + 1  # fresh, empty form after success
                         note = " (date detected from file name)" if auto_date else ""
                         flash(f"Transactions saved for '{final_label}'{note}: {len(tt)} rows.")
                     except Exception as e:

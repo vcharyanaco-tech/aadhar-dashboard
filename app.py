@@ -210,7 +210,9 @@ def init_db():
     try:
         parsers.ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0", "division": "TEXT"})
         parsers.ensure_cols(con, "station_transfers", {"old_address": "TEXT", "new_address": "TEXT"})
-        parsers.ensure_cols(con, "mbu_camps", {"district": "TEXT", "camp_end_date": "TEXT"})  # both added after the first MBU release
+        parsers.ensure_cols(con, "mbu_camps", {"district": "TEXT", "camp_end_date": "TEXT",
+                                              "station_id": "TEXT",
+                                              "sid_required": "INTEGER DEFAULT 0"})  # added after the first MBU release
         # The report queries filter on tx.upload_id and join on tx.key; without
         # these every page load is a full scan of a table that grows daily.
         parsers.ensure_indexes(con)
@@ -2577,8 +2579,10 @@ def backup_tab():
 
 # ---------------------------------------------------------------- MBU camps
 # A monthly plan sheet (Division, Camp Location, Camp Date) is uploaded by the admin.
-# Those three columns are fixed: nobody can edit them afterwards. Division users
-# (and the admin) fill only "Number of Transactions" and "Remarks" per camp.
+# Those three columns are fixed: nobody can edit them afterwards. The sheet may also carry a
+# "Station ID" column, left blank: it is NOT read from the sheet. Division users (and the
+# admin) fill "Station ID", "Number of Transactions" and "Remarks" per camp, and Station ID
+# is mandatory - an entry is not saved without it.
 #
 # Designed for a sheet that arrives roughly every month:
 #   * each upload is a batch; new camps are ADDED, existing ones are never overwritten,
@@ -2596,7 +2600,7 @@ _MBU_HEADERS = {
     "location": ("location", "camplocation", "camplocationname", "campplace", "venue", "place"),
     "date": ("date", "campdate", "dateofcamp"),
 }
-_MBU_TXN, _MBU_REM = "Number of Transactions", "Remarks"
+_MBU_TXN, _MBU_REM, _MBU_SID = "Number of Transactions", "Remarks", "Station ID"
 # The only remarks allowed when a camp reports 0 transactions.
 _ZERO_REASONS = ["Denied By School Authorities", "Shortage of User", "User on leave"]
 
@@ -2609,6 +2613,30 @@ def _mbu_remark_problem(txn, remark):
     if txn != 0 and remark in _ZERO_REASONS:
         return "has a zero-transaction reason, but its Number of Transactions is not 0"
     return None
+
+
+def _clean_station_id(v):
+    """Station ID as typed, trimmed, inner whitespace collapsed; '' when blank."""
+    if v is None or pd.isna(v):
+        return ""
+    return re.sub(r"\s+", " ", str(v)).strip()
+
+
+def _mbu_entry_problem(txn, remark, sid, required=True):
+    """Why an entry cannot be saved, or None.
+
+    A row left completely blank is a cleared entry and is allowed. Any other row needs
+    Number of Transactions plus the remark rule for 0 transactions, and a Station ID when
+    `required` - which is only the case for camps added by a sheet uploaded after the
+    Station ID rule was introduced. Camps that were already in the database stay optional.
+    """
+    if txn is None and not remark and not sid:
+        return None
+    if required and not sid:
+        return "needs a Station ID (mandatory)"
+    if txn is None:
+        return "needs Number of Transactions"
+    return _mbu_remark_problem(txn, remark)
 
 
 def _mbu_col_map(values):
@@ -2760,7 +2788,7 @@ def save_mbu_batch(rows, filename, by):
         for r in rows:
             c = con.execute(
                 "INSERT OR IGNORE INTO mbu_camps(batch_id, camp_date, camp_end_date, division, district, location,"
-                " dedupe_key, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                " dedupe_key, created_by, created_at, sid_required) VALUES (?,?,?,?,?,?,?,?,?,1)",
                 (batch_id, r["date"], r.get("end_date") or None, r["division"], r["district"], r["location"],
                  r["key"], by, now))
             added += c.rowcount
@@ -2784,7 +2812,7 @@ def save_mbu_batch(rows, filename, by):
 
 
 def update_mbu_entries(changes, by):
-    """Save Number of Transactions / Remarks. changes = {id: (transactions|None, remarks)}.
+    """Save Station ID / Number of Transactions / Remarks. changes = {id: (transactions|None, remarks, station_id)}.
 
     The division check is repeated here, not left to the editor widget: a
     non-admin can only change rows of the division their login is linked to.
@@ -2795,14 +2823,15 @@ def update_mbu_entries(changes, by):
     saved = 0
     con = connect()
     try:
-        for cid, (txn, rem) in changes.items():
-            row = con.execute("SELECT division FROM mbu_camps WHERE id=?", (cid,)).fetchone()
+        for cid, (txn, rem, sid) in changes.items():
+            row = con.execute("SELECT division, sid_required FROM mbu_camps WHERE id=?", (cid,)).fetchone()
             if row is None or (not admin and parsers.norm(row["division"]) != mine):
                 continue
-            if _mbu_remark_problem(txn, rem):
+            sid = _clean_station_id(sid)
+            if _mbu_entry_problem(txn, rem, sid, bool(row["sid_required"])):  # repeated server-side
                 continue
-            con.execute("UPDATE mbu_camps SET transactions=?, remarks=?, updated_by=?, updated_at=? WHERE id=?",
-                        (txn, rem, by, now, cid))
+            con.execute("UPDATE mbu_camps SET station_id=?, transactions=?, remarks=?, updated_by=?, updated_at=?"
+                        " WHERE id=?", (sid or None, txn, rem, by, now, cid))
             saved += 1
         con.commit()
     finally:
@@ -2840,14 +2869,15 @@ def mbu_upload_panel():
     if not is_admin():  # server-side guard
         return
     with st.expander("Upload MBU camp sheet (admin)"):
-        st.caption("Columns: Division, District, Camp Location, Camp Date. Camp Date can be one date or a date range "
+        st.caption("Columns: Division, District, Camp Location, Camp Date, and a blank Station ID column (divisions fill it "
+                   "while entering figures). Camp Date can be one date or a date range "
                    "(e.g. 15-11-2026 to 17-11-2026). Upload one sheet per month. Camps already "
                    "present (same date + division + location) are left untouched, so entries already made "
                    "are never lost; only new camps are added. Division names must match the master sheet. "
                    "If a date or location was wrong in an earlier upload, delete that row below and upload again.")
         st.download_button("Download sample format (CSV)",
-                           "Division,District,Camp Location,Camp Date\nSample Division,Sample District,Sample Post Office,15-11-2026\n"
-                           "Sample Division,Sample District,Sample Post Office 2,18-11-2026 to 20-11-2026\n"
+                           "Division,District,Camp Location,Camp Date,Station ID\nSample Division,Sample District,Sample Post Office,15-11-2026,\n"
+                           "Sample Division,Sample District,Sample Post Office 2,18-11-2026 to 20-11-2026,\n"
                            .encode("utf-8-sig"), "mbu_camps_sample.csv", "text/csv", key="mbu_sample_dl")
         if not get_divisions():
             st.info("Upload the master sheet first, so division names can be checked.")
@@ -2907,14 +2937,16 @@ def mbu_upload_panel():
 
 def mbu_camps_section():
     mbu_upload_panel()
-    df = read_sql("SELECT id, camp_date, camp_end_date, division, district, location, transactions, remarks,"
-                  " updated_by, updated_at"
+    df = read_sql("SELECT id, camp_date, camp_end_date, division, district, location, station_id, sid_required,"
+                  " transactions, remarks, updated_by, updated_at"
                   " FROM mbu_camps ORDER BY camp_date, division, location")
     if df.empty:
         st.info("No MBU camp sheet has been uploaded yet." + (" Please contact the admin." if not is_admin() else ""))
         return
     df["transactions"] = pd.to_numeric(df["transactions"], errors="coerce")  # all-NULL column arrives as object
     df["district"] = df["district"].fillna("")
+    df["station_id"] = df["station_id"].map(_clean_station_id)
+    df["sid_required"] = pd.to_numeric(df["sid_required"], errors="coerce").fillna(0).astype(int)
     df["camp_end_date"] = df["camp_end_date"].fillna("")
     df["_camp_text"] = [_camp_date_text(a, b) for a, b in zip(df["camp_date"], df["camp_end_date"])]
     # A range that crosses a month boundary is listed under every month it touches.
@@ -2946,7 +2978,7 @@ def mbu_camps_section():
     k[2].metric("Pending", f"{int(pool['transactions'].isna().sum()):,}")
     k[3].metric("Total transactions", f"{int(pool['transactions'].fillna(0).sum()):,}")
 
-    # ---- entry grid: only Transactions and Remarks can be changed
+    # ---- entry grid: only Station ID, Transactions and Remarks can be changed
     st.subheader("Enter transactions")
     if is_admin():
         editable = pool
@@ -2963,31 +2995,37 @@ def mbu_camps_section():
     if editable.empty:
         st.info("No camps to fill for the selected filters.")
     else:
-        st.caption("Division, District, Camp Location and Camp Date are fixed. Fill Number of Transactions and "
-                   "Remarks, then click Save entries. If Number of Transactions is 0, choose the reason in Remarks "
+        st.caption("Division, District, Camp Location and Camp Date are fixed. Fill Station ID (mandatory for camps from the newly uploaded sheet), Number of "
+                   "Transactions and Remarks, then click Save entries; such a row without a Station ID is not saved. "
+                   "If Number of Transactions is 0, choose the reason in Remarks "
                    "(" + ", ".join(_ZERO_REASONS) + "); no other remark is accepted for a 0-transaction camp.")
-        g = editable.set_index("id")[["division", "district", "location", "_camp_text", "transactions", "remarks"]].copy()
+        g = editable.set_index("id")[["division", "district", "location", "_camp_text", "station_id",
+                                      "transactions", "remarks"]].copy()
         g["transactions"] = pd.to_numeric(g["transactions"], errors="coerce").astype("Int64")
         g["remarks"] = g["remarks"].fillna("").astype(str).str.strip()
         # Free-text remarks saved before this rule are kept in the database but shown blank in the
         # dropdown (a dropdown cannot show a value that is not one of its options).
         legacy = {int(i): r for i, r in g["remarks"].items() if r and r not in _ZERO_REASONS}
         g["remarks"] = g["remarks"].where(g["remarks"].isin(_ZERO_REASONS), None).astype(object)
-        g.columns = ["Division", "District", "Camp Location", "Camp Date", _MBU_TXN, _MBU_REM]
+        g.columns = ["Division", "District", "Camp Location", "Camp Date", _MBU_SID, _MBU_TXN, _MBU_REM]
         ver = st.session_state.get("mbu_ver", 0)  # new key after a save, so stale edits are not replayed
         edited = st.data_editor(
             g, hide_index=True, use_container_width=True, num_rows="fixed",
             disabled=["Division", "District", "Camp Location", "Camp Date"],
-            column_config={_MBU_TXN: st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
+            column_config={_MBU_SID: st.column_config.TextColumn(max_chars=40, help="Mandatory for camps from the new sheet onward; older camps may stay blank."),
+                           _MBU_TXN: st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
                            _MBU_REM: st.column_config.SelectboxColumn(options=_ZERO_REASONS, required=False)},
             key=f"mbu_grid_{ver}_{month}_{dv}_{status}")
 
+        sid_req = {int(i): bool(v) for i, v in editable.set_index("id")["sid_required"].items()}
         changes, bad, bad_rem = {}, [], []
         for cid in g.index:
             o_t = None if pd.isna(g.at[cid, _MBU_TXN]) else int(g.at[cid, _MBU_TXN])
             o_raw = g.at[cid, _MBU_REM]
             o_r = "" if o_raw is None or pd.isna(o_raw) else str(o_raw).strip()
             raw_t, raw_r = edited.at[cid, _MBU_TXN], edited.at[cid, _MBU_REM]
+            o_s = _clean_station_id(g.at[cid, _MBU_SID])
+            n_s = _clean_station_id(edited.at[cid, _MBU_SID])
             n_r = "" if raw_r is None or pd.isna(raw_r) else str(raw_r).strip()
             if raw_t is None or pd.isna(raw_t):
                 n_t = None
@@ -2996,18 +3034,18 @@ def mbu_camps_section():
                 continue
             else:
                 n_t = int(raw_t)
-            if (o_t, o_r) != (n_t, n_r):
+            if (o_t, o_r, o_s) != (n_t, n_r, n_s):
                 if n_r == "" and n_t != 0 and int(cid) in legacy:
                     n_r = legacy[int(cid)]  # an older free-text remark is not wiped by editing the figure
-                why = _mbu_remark_problem(n_t, n_r)
+                why = _mbu_entry_problem(n_t, n_r, n_s, sid_req[int(cid)])
                 if why:
                     bad_rem.append(f"{g.at[cid, 'Camp Location']} ({g.at[cid, 'Camp Date']}) {why}")
                     continue
-                changes[int(cid)] = (n_t, n_r)
+                changes[int(cid)] = (n_t, n_r, n_s)
         if bad:
             st.error("Number of Transactions must be a whole number, 0 or more: " + "; ".join(bad))
         if bad_rem:
-            st.error("Remarks not accepted - fix these rows before saving:\n\n- " + "\n- ".join(bad_rem))
+            st.error("Entries not accepted - fix these rows before saving:\n\n- " + "\n- ".join(bad_rem))
         st.caption(f"{len(changes)} row(s) changed." if changes else "No unsaved changes.")
         if st.button("Save entries", type="primary", disabled=not changes or bool(bad) or bool(bad_rem),
                      key="mbu_save"):
@@ -3018,12 +3056,13 @@ def mbu_camps_section():
     # ---- read-only report for everyone
     st.divider()
     st.subheader("MBU camp report")
-    show = pool.assign(camp_date=pool["_camp_text"],
+    show = pool.assign(camp_date=pool["_camp_text"], station_id=pool["station_id"],
                        transactions=pool["transactions"].astype("Int64"),
                        remarks=pool["remarks"].fillna("")
-                       )[["division", "district", "location", "camp_date", "transactions", "remarks", "updated_by", "updated_at"]]
+                       )[["division", "district", "location", "camp_date", "station_id", "transactions", "remarks",
+                                                                  "updated_by", "updated_at"]]
     show = show.rename(columns={"division": "Division", "district": "District", "location": "Camp Location", "camp_date": "Camp Date",
-                                "transactions": _MBU_TXN, "remarks": _MBU_REM,
+                                "station_id": _MBU_SID, "transactions": _MBU_TXN, "remarks": _MBU_REM,
                                 "updated_by": "Last updated by", "updated_at": "Last updated at"})
     st.dataframe(show, hide_index=True, use_container_width=True)
     d1, d2 = st.columns(2)

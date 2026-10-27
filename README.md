@@ -198,6 +198,71 @@ source of truth for its build, start, region and environment settings. Supply
 taking it from the repository, so it is never committed. Create the admin
 account through the first-run screen after the first deploy.
 
+### Memory on the free instance
+
+Render's free plan gives this service **512 MB of RAM**. Streamlit, pandas,
+pyarrow and plotly already use roughly 120 MB before a report is drawn, and a
+dashboard session takes that to about 200 MB. Several browser sessions, a large
+workbook, or a burst of report reruns can push the process over the limit. When
+that happens Render kills the instance and immediately starts a new one; the
+browser sees a 503 or a one- to two-minute wait, then the dashboard works
+again. That looks like a slow site, but it is not a routing or keepalive fault.
+
+`render.yaml` and the live service therefore set `MALLOC_ARENA_MAX=2`,
+`MALLOC_TRIM_THRESHOLD_=65536`, `OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`,
+`NUMEXPR_NUM_THREADS=1` and `MKL_NUM_THREADS=1`. The report caches have a
+bounded number of entries, `.streamlit/config.toml` releases a disconnected
+session after 30 seconds instead of 120, and `parsers.iter_sheets` reads one
+Excel sheet at a time instead of materialising the whole workbook. These keep
+the working set well below the cap but cannot make 512 MB support unlimited
+concurrent users or arbitrarily large uploads.
+
+If `server_failed` events with `oomKilled.memoryLimit: 512Mi` continue under
+normal use, the reliable fix is a paid instance with more RAM. Render's
+**Starter Plus (1 GB, $15/month)** or **Standard (2 GB, $25/month)** plans both
+do that; **Starter ($7/month) is still 512 MB and would not fix an OOM.**
+Changing plans is a deliberate cost decision, so it is not part of this
+configuration.
+
+### Interaction performance
+
+Streamlit still re-executes code on every interaction; that is its execution
+model. The app therefore narrows and batches the reruns it can:
+
+- Dashboard, Operator Analysis, Report, Camps and Backup are `@st.fragment`s.
+  A filter change inside one of them no longer re-runs the sidebar, login check
+  or the other page functions.
+- The MBU data editor is inside a form. Cell edits stay in the browser until
+  **Save entries**, instead of causing a page rerun per keystroke.
+- The client no longer draws Streamlit's rerun transition: stale content stays
+  at full opacity, the animated running indicator and loading skeleton are
+  hidden, and the Stop control remains available. This is a CSS-only fix for
+  the 1.5-second fade that made fast fragment renders still feel slow. Long
+  backup operations still show their own explicit spinner text.
+- `init_db()` is a `@st.cache_resource` keyed by the database path, so its
+  `CREATE TABLE IF NOT EXISTS` and index checks run once per process, not once
+  per click.
+- The seven-day Division chart is `@st.cache_data` keyed by the selected uploads
+  and Division/Sub Division filters. It is cleared with the other report caches
+  whenever master, transactions or transfers change.
+
+Measured on 2026-10-22 against a copy of the 5.9 MB production database, using
+the same Chrome browser and local Streamlit server for both versions:
+
+| Interaction | Before | After |
+|---|---:|---:|
+| Dashboard fragment body (server render) | ~330 ms | ~195 ms |
+| Division filter, browser-visible update | ~164 ms | ~136 ms |
+| MBU cell edit | one full rerun per edit | no rerun until Save |
+
+The browser figures are medians of nine alternating Division selections. The
+absolute times will be higher on Render's throttled CPU, but the ratio is the
+part that carries over. Separately, Streamlit's 33%-opacity, 1.5-second stale
+fade and loading skeleton are disabled, so a rerun no longer looks slow even
+when the server render is only a few hundred milliseconds. Fragments do not
+make Streamlit rerun-free: page navigation and writes still re-run more than a
+fragment does.
+
 ### Surviving the free plan's lack of a disk
 
 This service has **no persistent disk**, because Render only offers disks on paid

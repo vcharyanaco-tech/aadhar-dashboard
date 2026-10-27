@@ -589,10 +589,11 @@ class TestEnsureCols:
     def test_adds_missing_columns(self):
         con = sqlite3.connect(":memory:")
         con.execute("CREATE TABLE t(a TEXT)")
-        added = parsers.ensure_cols(con, "t", {"b": "REAL"})
-        assert added == ["b"]
+        added = parsers.ensure_cols(con, "t", {"b": "REAL", "c": "INTEGER DEFAULT 0"})
+        assert added == ["b", "c"]
         cols = {r[1] for r in con.execute("PRAGMA table_info('t')")}
-        assert cols == {"a", "b"}
+        assert cols == {"a", "b", "c"}
+        assert con.execute("PRAGMA table_info('t')").fetchall()[2][4] == "0"
         con.close()
 
     def test_is_a_noop_for_a_table_that_does_not_exist(self):
@@ -604,4 +605,11 @@ class TestEnsureCols:
         con = sqlite3.connect(":memory:")
         with pytest.raises(ValueError):
             parsers.ensure_cols(con, "t; DROP TABLE users", {"b": "REAL"})
+        con.close()
+
+    def test_rejects_an_injected_column_declaration(self):
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE t(a TEXT)")
+        with pytest.raises(ValueError):
+            parsers.ensure_cols(con, "t", {"b": "TEXT; DROP TABLE users"})
         con.close()

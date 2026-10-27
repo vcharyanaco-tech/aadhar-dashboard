@@ -585,6 +585,7 @@ def ensure_audit_index_on(con):
 # Identifiers that reach SQL as text. `quote_ident` accepts a value only if it
 # matches, so nothing caller-supplied can ever be interpolated into a statement.
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_COLUMN_DECL_RE = re.compile(r"^(?:TEXT|INTEGER|REAL)(?: DEFAULT (?:0|1|NULL))?$")
 
 
 def quote_ident(name):
@@ -619,9 +620,9 @@ def ensure_cols(con, table, wanted):
     for name, typ in wanted.items():
         if name in have:
             continue
-        # `typ` is a type name from this module's own constants, not user input,
-        # but it is validated as an identifier too so it cannot carry a clause.
-        con.execute(f"ALTER TABLE {t} ADD COLUMN {quote_ident(name)} {quote_ident(typ)}")
+        if not isinstance(typ, str) or not _COLUMN_DECL_RE.fullmatch(typ):
+            raise ValueError(f"refusing to use {typ!r} as a SQL column declaration")
+        con.execute(f"ALTER TABLE {t} ADD COLUMN {quote_ident(name)} {typ}")
         added.append(name)
     return added
 

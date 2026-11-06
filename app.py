@@ -2432,9 +2432,11 @@ def compute_circle_split(agg_full, camps, dated, day_agg):
     Returns (report, check, detail) DataFrames.
     """
     a = agg_full.copy()
-    for c in ("enr", "mbu", "demo", "nonmbu"):
+    for c in ("enr", "mbu", "demo", "nonmbu", "total"):
         a[c] = pd.to_numeric(a[c], errors="coerce").fillna(0)
-    a["upd"] = a["mbu"] + a["nonmbu"]
+    # Updation = everything that is neither Enrolment nor Demographic, so the three columns always add up
+    # to the Report's Total (even if a station has a category outside MBU / Non-MBU).
+    a["upd"] = a["total"] - a["enr"] - a["demo"]
     key_div = a.groupby("key")["division"].first().to_dict()
     overall = a.groupby("division")[CIRCLE_COMPONENTS].sum()
     canon = {parsers.norm(d): d for d in overall.index}
@@ -2446,7 +2448,7 @@ def compute_circle_split(agg_full, camps, dated, day_agg):
     def prepared(d):
         if d not in day_cache:
             x = day_agg(d).copy()
-            for c in ("enr", "mbu", "demo", "nonmbu"):
+            for c in ("enr", "mbu", "demo", "nonmbu", "total"):
                 x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0)
             x["_k"] = x["key"].astype(str).map(parsers.norm)
             x["_s"] = x["station"].fillna("").astype(str).map(parsers.norm) if "station" in x else ""
@@ -2484,7 +2486,7 @@ def compute_circle_split(agg_full, camps, dated, day_agg):
                         continue
                     used.add(uk)
                     names.append(str(h.get("station") or h["key"]))
-                    e[0] += h["enr"]; e[1] += h["mbu"] + h["nonmbu"]; e[2] += h["demo"]
+                    e[0] += h["enr"]; e[1] += h["total"] - h["enr"] - h["demo"]; e[2] += h["demo"]
                     div = canon.get(parsers.norm(key_div.get(h["key"], h.get("division", div))), key_div.get(h["key"], div))
             if not days:
                 status = "No daily upload on the camp date(s)"
@@ -2602,7 +2604,7 @@ def circle_report_excel(report, check, detail, period_text):
     for c in range(2, 11):
         ws.column_dimensions[L(c)].width = 19
     ws.freeze_panes = "B4"
-    ws.cell(g + 2, 1, "Updation = MBU + Non-MBU biometric updates; Demographic = demographic updates; Total = sum "
+    ws.cell(g + 2, 1, "Updation = all updates other than demographic; Demographic = demographic updates; Total = sum "
                       "of the three. Camp figures come from the daily data of the Station ID filled for each camp; "
                       "Centres = all other transactions.").font = f(italic=True, size=10)
 

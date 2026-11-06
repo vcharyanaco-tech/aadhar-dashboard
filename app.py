@@ -217,6 +217,7 @@ def _init_db_cached(db_path):
     try:
         parsers.ensure_cols(con, "users", {"must_change": "INTEGER DEFAULT 0", "division": "TEXT"})
         parsers.ensure_cols(con, "station_transfers", {"old_address": "TEXT", "new_address": "TEXT"})
+        parsers.ensure_cols(con, "camps", {"station_id": "TEXT"})  # Station ID of the camp machine (admin circle report)
         parsers.ensure_cols(con, "mbu_camps", {"district": "TEXT", "camp_end_date": "TEXT",
                                               "station_id": "TEXT",
                                               "sid_required": "INTEGER DEFAULT 0"})  # added after the first MBU release
@@ -1286,12 +1287,12 @@ def get_subdivisions(division):
     return list(d["sub_division"])
 
 
-def save_camp(camp_date, division, sub_division, location, transactions, remarks, by):
-    run("""INSERT INTO camps(camp_date, division, sub_division, location, transactions, remarks, created_by, created_at)
-        VALUES (?,?,?,?,?,?,?,?)""",
+def save_camp(camp_date, division, sub_division, location, transactions, remarks, by, station_id=""):
+    run("""INSERT INTO camps(camp_date, division, sub_division, location, transactions, remarks, created_by,
+        created_at, station_id) VALUES (?,?,?,?,?,?,?,?,?)""",
         (camp_date, division, sub_division, location, transactions, remarks, by,
-         datetime.now().strftime("%Y-%m-%d %H:%M")))
-    audit("camp.create", f"{camp_date} {division}/{sub_division} {location} ({transactions})")
+         datetime.now().strftime("%Y-%m-%d %H:%M"), _clean_station_id(station_id) or None))
+    audit("camp.create", f"{camp_date} {division}/{sub_division} {location} ({transactions}) sid={station_id}")
     kv_sync.request_backup()
 
 
@@ -2393,6 +2394,344 @@ def report_tab():
         st.download_button("Download Not Working Stations CSV", nw.to_csv(index=False).encode("utf-8-sig"),
                            "haryana_circle_not_working_stations.csv", "text/csv", key="dl_not_working")
 
+    # Admin-only: Centres vs Camps bifurcation in the circle-wise weekly report format.
+    if is_admin():
+        st.divider()
+        circle_weekly_report_admin(agg_full, ids)
+
+
+# ---------------------------------------------------------------- admin: circle weekly report
+# BEGIN circle_split
+CIRCLE_COMPONENTS = ["enr", "upd", "demo"]  # Enrolment, Updation (MBU + Non-MBU biometric), Demographic
+
+
+def _station_match_keys(sid):
+    """Normalised spellings of a typed Station ID that may equal a station key / name / office id."""
+    s = _clean_station_id(sid)
+    if not s:
+        return set()
+    out = {parsers.norm(s)}
+    try:
+        out.add(norm_key(s))
+    except Exception:
+        pass
+    return {x for x in out if x}
+
+
+def compute_circle_split(agg_full, camps, dated, day_agg):
+    """Split the period's transactions into Centres and Camps, per Division.
+
+    agg_full : the Report page's station aggregate for the whole selected period (the 'main total').
+    camps    : list of dicts (source, id, start, end, division, location, station_id, conducted).
+    dated    : {date: [upload ids]} of the selected period.
+    day_agg  : callable(date) -> station aggregate of that single day.
+
+    Camp transactions = what the camp's Station ID recorded in the DAILY data on the camp date(s).
+    Each (station, date) is counted once. Centres = main total - camps, so Centres + Camps always
+    equals the main total, Division by Division.
+    Returns (report, check, detail) DataFrames.
+    """
+    a = agg_full.copy()
+    for c in ("enr", "mbu", "demo", "nonmbu"):
+        a[c] = pd.to_numeric(a[c], errors="coerce").fillna(0)
+    a["upd"] = a["mbu"] + a["nonmbu"]
+    key_div = a.groupby("key")["division"].first().to_dict()
+    overall = a.groupby("division")[CIRCLE_COMPONENTS].sum()
+    canon = {parsers.norm(d): d for d in overall.index}
+
+    lo, hi = (min(dated), max(dated)) if dated else (None, None)
+    day_cache, used = {}, set()
+    camp_tx, camp_cnt, detail = {}, {}, []
+
+    def prepared(d):
+        if d not in day_cache:
+            x = day_agg(d).copy()
+            for c in ("enr", "mbu", "demo", "nonmbu"):
+                x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0)
+            x["_k"] = x["key"].astype(str).map(parsers.norm)
+            x["_s"] = x["station"].fillna("").astype(str).map(parsers.norm) if "station" in x else ""
+            x["_o"] = x["office_id"].fillna("").astype(str).map(parsers.norm) if "office_id" in x else ""
+            day_cache[d] = x
+        return day_cache[d]
+
+    for c in camps:
+        if lo is None or not (c["start"] <= hi and c["end"] >= lo):
+            continue  # camp outside the selected period
+        row = {"Source": c["source"], "Division (camp entry)": c["division"], "Camp Location": c["location"],
+               "Camp Date": _camp_date_text(c["start"].isoformat(), c["end"].isoformat() if c["end"] != c["start"] else None),
+               "Station ID": c["station_id"], "Matched Station": "", "Enrolment": 0, "Updation": 0,
+               "Demographic": 0, "Total": 0}
+        div = canon.get(parsers.norm(c["division"]), c["division"])
+        if not c["conducted"]:
+            row["Status"] = "Not counted (no entry yet / 0 transactions)"
+            detail.append(row)
+            continue
+        status, e = None, [0, 0, 0]
+        if not c["station_id"]:
+            status = "No Station ID - transactions not available"
+        else:
+            keys = _station_match_keys(c["station_id"])
+            days = [d for d in sorted(dated) if c["start"] <= d <= c["end"]]
+            seen_match, dup, names = False, False, []
+            for d in days:
+                x = prepared(d)
+                hit = x[x["_k"].isin(keys) | x["_s"].isin(keys) | x["_o"].isin(keys)]
+                for _, h in hit.iterrows():
+                    seen_match = True
+                    uk = (str(h["key"]), d)
+                    if uk in used:
+                        dup = True
+                        continue
+                    used.add(uk)
+                    names.append(str(h.get("station") or h["key"]))
+                    e[0] += h["enr"]; e[1] += h["mbu"] + h["nonmbu"]; e[2] += h["demo"]
+                    div = canon.get(parsers.norm(key_div.get(h["key"], h.get("division", div))), key_div.get(h["key"], div))
+            if not days:
+                status = "No daily upload on the camp date(s)"
+            elif not seen_match:
+                status = "Station ID not found in daily data on camp date(s)"
+            elif sum(e) == 0 and dup:
+                status = "Already counted in another camp (same station and date)"
+            else:
+                status = "Matched" + (" (some days already counted elsewhere)" if dup else "")
+            row["Matched Station"] = ", ".join(sorted(set(names)))
+        e = [int(round(v)) for v in e]
+        row.update({"Enrolment": e[0], "Updation": e[1], "Demographic": e[2], "Total": sum(e), "Status": status})
+        t = camp_tx.setdefault(div, [0, 0, 0])
+        for i in range(3):
+            t[i] += e[i]
+        camp_cnt[div] = camp_cnt.get(div, 0) + 1
+        row["Division (counted under)"] = div
+        detail.append(row)
+
+    divs = sorted(set(overall.index) | set(camp_tx) | set(camp_cnt))
+    ov = overall.reindex(divs).fillna(0).round().astype(int)
+    ck = pd.DataFrame([camp_tx.get(d, [0, 0, 0]) for d in divs], index=divs, columns=CIRCLE_COMPONENTS).astype(int)
+    ce = ov - ck
+    report = pd.DataFrame({
+        "Division": divs,
+        "C_enr": ce["enr"].values, "C_upd": ce["upd"].values, "C_demo": ce["demo"].values,
+        "Camps": [camp_cnt.get(d, 0) for d in divs],
+        "K_enr": ck["enr"].values, "K_upd": ck["upd"].values, "K_demo": ck["demo"].values})
+    check = pd.DataFrame({
+        "Division": divs, "Main Total": ov.sum(axis=1).values,
+        "Centres Total": ce.sum(axis=1).values, "Camps Total": ck.sum(axis=1).values})
+    check["Difference"] = check["Main Total"] - check["Centres Total"] - check["Camps Total"]
+    detail = pd.DataFrame(detail)
+    return report, check, detail
+# END circle_split
+
+
+def _circle_report_frames(report):
+    """Display frame (with Total columns and a Grand Total row) from compute_circle_split's report."""
+    d = report.copy()
+    d["C_tot"] = d["C_enr"] + d["C_upd"] + d["C_demo"]
+    d["K_tot"] = d["K_enr"] + d["K_upd"] + d["K_demo"]
+    d = d[["Division", "C_enr", "C_upd", "C_demo", "C_tot", "Camps", "K_enr", "K_upd", "K_demo", "K_tot"]]
+    grand = pd.DataFrame([["Grand Total"] + [int(d[c].sum()) for c in d.columns[1:]]], columns=d.columns)
+    d = pd.concat([d, grand], ignore_index=True)
+    d.columns = ["Division", "Centres - Total Enrolment Transactions", "Centres - Total Updation Transactions",
+                 "Centres - Total Demographic Update Transactions", "Centres - Total",
+                 "No. of Camps Conducted", "Camps - Total Enrolment Transactions",
+                 "Camps - Total Updation Transactions", "Camps - Total Demographic Update Transactions",
+                 "Camps - Total"]
+    return d
+
+
+def circle_report_excel(report, check, detail, period_text):
+    """Workbook in the layout of 'Circle-wise Weekly Aadhaar Transaction and Camp Details'.
+
+    Total columns, the Grand Total row and the reconciliation sheet are live formulas.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter as L
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Circle Report"
+    f = lambda **k: Font(name="Times New Roman", size=k.pop("size", 12), **k)
+    thin = Side(style="thin")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    red = PatternFill("solid", fgColor="BF0000")
+    ctr = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    ws["A1"] = f"Division-wise Weekly Aadhaar Transaction and Camp Details - Haryana Circle ({period_text})"
+    ws.merge_cells("A1:J1")
+    ws["A1"].font, ws["A1"].alignment = f(size=15, bold=True), ctr
+    ws["A2"] = "Name of Division"
+    ws.merge_cells("A2:A3")
+    ws["B2"] = "Total Transactions from centres"
+    ws.merge_cells("B2:E2")
+    ws["F2"] = " No of camps conducted per week"
+    ws.merge_cells("F2:F3")
+    ws["G2"] = "Total Transactions from camps "
+    ws.merge_cells("G2:J2")
+    sub = ["Total Enrolment Transactions", "Total Updation Transactions",
+           "Total Demographic Update transactions", "Total "]
+    for i, t in enumerate(sub):
+        ws.cell(3, 2 + i, t)
+        ws.cell(3, 7 + i, t)
+    for r in (2, 3):
+        for c in range(1, 11):
+            x = ws.cell(r, c)
+            x.font, x.fill, x.alignment, x.border = f(bold=True, color="FFFFFF"), red, ctr, box
+    ws.row_dimensions[3].height = 48
+
+    first = 4
+    for i, r in enumerate(report.itertuples(index=False)):
+        n = first + i
+        vals = [r.Division, r.C_enr, r.C_upd, r.C_demo, f"=SUM(B{n}:D{n})", r.Camps,
+                r.K_enr, r.K_upd, r.K_demo, f"=SUM(G{n}:I{n})"]
+        for c, v in enumerate(vals, 1):
+            ws.cell(n, c, v)
+    last = first + len(report) - 1
+    g = last + 1
+    ws.cell(g, 1, "Grand Total")
+    for c in range(2, 11):
+        ws.cell(g, c, f"=SUM({L(c)}{first}:{L(c)}{last})")
+    for n in range(first, g + 1):
+        for c in range(1, 11):
+            x = ws.cell(n, c)
+            bold = n == g or c in (1, 5, 10)
+            x.font, x.border = f(bold=bold), box
+            x.alignment = Alignment(horizontal="left" if c == 1 else "center", vertical="center")
+            if c > 1:
+                x.number_format = "#,##0"
+    ws.column_dimensions["A"].width = 24
+    for c in range(2, 11):
+        ws.column_dimensions[L(c)].width = 19
+    ws.freeze_panes = "B4"
+    ws.cell(g + 2, 1, "Updation = MBU + Non-MBU biometric updates; Demographic = demographic updates; Total = sum "
+                      "of the three. Camp figures come from the daily data of the Station ID filled for each camp; "
+                      "Centres = all other transactions.").font = f(italic=True, size=10)
+
+    rc = wb.create_sheet("Reconciliation")
+    heads = ["Division", "Main Total (daily data)", "Centres Total", "Camps Total", "Difference (should be 0)"]
+    for c, t in enumerate(heads, 1):
+        x = rc.cell(1, c, t)
+        x.font, x.fill, x.alignment, x.border = f(bold=True, color="FFFFFF"), red, ctr, box
+    for i, r in enumerate(check.itertuples(index=False)):
+        n = 2 + i
+        src_row = first + i
+        rc.cell(n, 1, r[0])
+        rc.cell(n, 2, int(r[1])).font = f(color="0000FF")  # input: total taken from the Report page data
+        rc.cell(n, 3, f"='Circle Report'!E{src_row}")
+        rc.cell(n, 4, f"='Circle Report'!J{src_row}")
+        rc.cell(n, 5, f"=B{n}-C{n}-D{n}")
+    rl = 1 + len(check)
+    t = rl + 1
+    rc.cell(t, 1, "Grand Total")
+    for c in range(2, 6):
+        rc.cell(t, c, f"=SUM({L(c)}2:{L(c)}{rl})")
+    for n in range(2, t + 1):
+        for c in range(1, 6):
+            x = rc.cell(n, c)
+            x.border = box
+            if not (c == 2 and n < t):
+                x.font = f(bold=n == t)
+            if c > 1:
+                x.number_format = "#,##0"
+    rc.column_dimensions["A"].width = 24
+    for c in range(2, 6):
+        rc.column_dimensions[L(c)].width = 24
+
+    dt = wb.create_sheet("Camp Details")
+    cols = list(detail.columns) if len(detail) else ["Source", "Camp Location", "Camp Date", "Station ID", "Status"]
+    for c, name in enumerate(cols, 1):
+        x = dt.cell(1, c, name)
+        x.font, x.fill, x.alignment, x.border = f(bold=True, color="FFFFFF"), red, ctr, box
+        dt.column_dimensions[L(c)].width = max(14, min(45, len(name) + 6))
+    for i, r in enumerate(detail.itertuples(index=False) if len(detail) else [], 2):
+        for c, v in enumerate(r, 1):
+            x = dt.cell(i, c, v)
+            x.font, x.border = f(), box
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def circle_weekly_report_admin(agg_full, ids):
+    """ADMIN ONLY. Division-wise report in the 'Circle-wise Weekly Aadhaar Transaction and Camp Details'
+    layout, with Centres and Camps shown separately; together they add up to the Report page's total."""
+    if not is_admin():  # defence in depth: never render for anyone else
+        return
+    st.subheader("Weekly Aadhaar Transaction and Camp Details (Admin only)")
+    st.caption("Same layout as the circle-wise weekly sheet, one row per Division. 'Camps' = what the Station ID "
+               "filled in each camp (Camps and MBU Camps) recorded in the daily transaction data on the camp "
+               "date(s); 'Centres' = every other transaction. Centres + Camps = the total of the Report above.")
+    marks = ",".join("?" * len(ids))
+    dated, undated = {}, 0
+    for r in run(f"SELECT id, label FROM uploads WHERE id IN ({marks})", tuple(ids), many=True):
+        d = parse_label_date(r["label"])
+        if d is None:
+            undated += 1
+        else:
+            dated.setdefault(d, []).append(r["id"])
+    if undated:
+        st.warning(f"{undated} selected upload(s) have a label that is not a date, so camp dates cannot be matched "
+                   "to them. Their transactions are counted under Centres. Select uploads labelled with dates.")
+
+    camps = []
+    if table_exists("camps"):
+        for r in read_sql("SELECT id, camp_date, division, location, station_id FROM camps").itertuples():
+            d = pd.to_datetime(r.camp_date, format="%d-%m-%Y", errors="coerce")
+            if pd.notna(d):
+                camps.append({"source": "Camp", "id": r.id, "start": d.date(), "end": d.date(),
+                              "division": r.division or "", "location": r.location or "",
+                              "station_id": _clean_station_id(r.station_id), "conducted": True})
+    if table_exists("mbu_camps"):
+        for r in read_sql("SELECT id, camp_date, camp_end_date, division, location, station_id, transactions"
+                          " FROM mbu_camps").itertuples():
+            s = pd.to_datetime(r.camp_date, format="%Y-%m-%d", errors="coerce")
+            if pd.isna(s):
+                continue
+            e = pd.to_datetime(r.camp_end_date, format="%Y-%m-%d", errors="coerce") if r.camp_end_date else pd.NaT
+            txn = pd.to_numeric(r.transactions, errors="coerce")
+            camps.append({"source": "MBU Camp", "id": r.id, "start": s.date(), "end": (e if pd.notna(e) else s).date(),
+                          "division": r.division or "", "location": r.location or "",
+                          "station_id": _clean_station_id(r.station_id),
+                          "conducted": bool(pd.notna(txn) and txn > 0)})
+
+    def day_agg(d):
+        return build_period_adj(tuple(dated[d]))[0]
+
+    report, check, detail = compute_circle_split(agg_full, camps, dated, day_agg)
+    out = _circle_report_frames(report)
+    st.dataframe(out, hide_index=True, use_container_width=True)
+
+    grand_main = int(pd.to_numeric(agg_full["total"], errors="coerce").fillna(0).sum())
+    grand_split = int(out.iloc[-1]["Centres - Total"] + out.iloc[-1]["Camps - Total"])
+    if grand_main == grand_split and (check["Difference"] == 0).all():
+        st.success(f"Check OK: Centres + Camps = {grand_split:,} = total transactions of the Report above.")
+    else:
+        st.error(f"Check failed: Centres + Camps = {grand_split:,} but the Report total is {grand_main:,}. "
+                 "See the Difference column below.")
+    with st.expander("Reconciliation - Main total vs Centres + Camps (Division-wise)"):
+        gt = pd.DataFrame([["Grand Total"] + [int(check[c].sum()) for c in check.columns[1:]]], columns=check.columns)
+        st.dataframe(pd.concat([check, gt], ignore_index=True), hide_index=True, use_container_width=True)
+
+    if len(detail):
+        bad = detail[~detail["Status"].str.startswith("Matched")]
+        label = f"Camp-wise details ({len(detail)} camp(s) in period"
+        label += f", {len(bad)} need attention)" if len(bad) else ")"
+        with st.expander(label, expanded=bool(len(bad))):
+            st.caption("Camps whose Station ID is missing or not found in the daily data show 0 transactions. "
+                       "Correct the Station ID in the Camps tab and this report updates.")
+            st.dataframe(detail, hide_index=True, use_container_width=True)
+    else:
+        st.info("No camps fall in the selected period.")
+
+    dates = sorted(dated)
+    period_text = (dates[0].strftime("%d-%m-%Y") + (" to " + dates[-1].strftime("%d-%m-%Y")
+                   if len(dates) > 1 else "")) if dates else "selected uploads"
+    a, b = st.columns(2)
+    a.download_button("Download Weekly Report Excel", circle_report_excel(report, check, detail, period_text),
+                      "haryana_weekly_transaction_and_camp_report.xlsx",
+                      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_circle_xlsx")
+    b.download_button("Download Weekly Report CSV", out.to_csv(index=False).encode("utf-8-sig"),
+                      "haryana_weekly_transaction_and_camp_report.csv", "text/csv", key="dl_circle_csv")
+
 
 def camp_entry_form():
     st.subheader("Add camp entry")
@@ -2424,9 +2763,12 @@ def camp_entry_form():
     subs = get_subdivisions(dv)
     sd = c2.selectbox("Sub Division", subs if subs else ["(none found in master)"], key="camp_sd")
     dt = c3.date_input("Camp date", value=datetime.now().date(), format="DD-MM-YYYY", key="camp_dt")
-    c4, c5 = st.columns([2, 1])
+    c4, c5, c6 = st.columns([2, 1, 1])
     loc = c4.text_input("Camp location", key="camp_loc")
-    txn = c5.number_input("Number of transactions", min_value=0, step=1, key="camp_txn")
+    sid = c5.text_input("Station ID", key="camp_sid", max_chars=40,
+                        help="Station ID of the machine used at the camp. Its transactions are taken from the "
+                             "daily transaction data for the camp date.")
+    txn = c6.number_input("Number of transactions", min_value=0, step=1, key="camp_txn")
     remarks = st.text_input("Remarks (optional)", key="camp_remarks")
     if st.button("Save camp entry"):
         # Server-side guard: the selectbox is not the authority. A non-admin may
@@ -2436,11 +2778,13 @@ def camp_entry_form():
             st.error("You can only add camp entries for your own Division.")
         elif not loc.strip():
             st.warning("Please enter the camp location.")
+        elif not _clean_station_id(sid):
+            st.warning("Please enter the Station ID used at the camp (mandatory).")
         elif not subs or sd not in subs:
             st.warning("No valid Sub Division was found in the master sheet for this division.")
         else:
             save_camp(dt.strftime("%d-%m-%Y"), dv, sd, loc.strip(), int(txn), remarks.strip(),
-                      st.session_state["user"]["username"])
+                      st.session_state["user"]["username"], station_id=sid)
             flash(f"Camp entry saved: {loc.strip()} ({dt.strftime('%d-%m-%Y')}).")
 
 
@@ -3267,11 +3611,12 @@ def general_camps_section():
     k2.metric("Total transactions", f"{int(pool['transactions'].sum()):,}")
     k3.metric("Divisions covered", f"{pool['division'].nunique():,}")
 
-    show = pool[["camp_date", "division", "sub_division", "location", "transactions", "remarks",
+    pool = pool.assign(station_id=pool["station_id"].map(_clean_station_id))
+    show = pool[["camp_date", "division", "sub_division", "location", "station_id", "transactions", "remarks",
                 "created_by"]].rename(columns={
         "camp_date": "Date", "division": "Division", "sub_division": "Sub Division",
-        "location": "Camp Location", "transactions": "Transactions", "remarks": "Remarks",
-        "created_by": "Entered by"})
+        "location": "Camp Location", "station_id": "Station ID", "transactions": "Transactions",
+        "remarks": "Remarks", "created_by": "Entered by"})
     st.dataframe(show, hide_index=True, use_container_width=True)
     d1, d2 = st.columns(2)
     d1.download_button("Download CSV", show.to_csv(index=False).encode("utf-8-sig"),
@@ -3297,6 +3642,20 @@ def general_camps_section():
         excel_download(summ_out, "Camp Summary", "aadhaar_camp_division_summary.xlsx", "Download Excel")
 
     if is_admin() and len(pool):
+        with st.expander("Set / change Station ID of a camp entry (admin)"):
+            st.caption("Camp entries saved before the Station ID field existed have no Station ID, so their "
+                       "transactions cannot be picked from the daily data. Fill it here.")
+            opts_sid = {f"{r['camp_date']} - {r['location']} ({r['division']}) [{r['station_id'] or 'no Station ID'}] "
+                        f"#{r['id']}": r for _, r in pool.iterrows()}
+            pick_sid = st.selectbox("Select entry", list(opts_sid), key="camp_sid_pick")
+            chosen = opts_sid[pick_sid]
+            new_sid = st.text_input("Station ID", value=chosen["station_id"], max_chars=40,
+                                    key=f"camp_sid_new_{chosen['id']}")
+            if st.button("Save Station ID", key="camp_sid_btn"):
+                run("UPDATE camps SET station_id=? WHERE id=?", (_clean_station_id(new_sid) or None, int(chosen["id"])))
+                audit("camp.station_id", f"#{chosen['id']} -> {new_sid}")
+                kv_sync.request_backup()
+                flash("Station ID saved.")
         with st.expander("Delete a camp entry"):
             opts = {f"{r['camp_date']} - {r['location']} ({r['division']}/{r['sub_division']}) #{r['id']}": r["id"]
                     for _, r in pool.iterrows()}

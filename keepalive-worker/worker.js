@@ -35,7 +35,7 @@ const DEFAULTS = { timeoutMs: 20000, path: '/aadhar-dashboard/_stcore/health' };
 
 // Cloudflare's bot rules reject default fetch agents, and a bare
 // `workers-fetch` UA can be challenged. Be explicit.
-const USER_AGENT = 'Mozilla/5.0 (compatible; aadhar-keepalive/1.0; +https://dashboardharyana.site)';
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -98,8 +98,12 @@ async function ping(env) {
     };
   }
 
-  // A cold start can outlast a single attempt, so give it one quick retry.
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  // Render's front door occasionally answers 429 to automated traffic even
+  // when the instance is healthy, and a cold start can outlast a single attempt.
+  // Retry on 429 / 5xx and on transport errors with a short backoff so a single
+  // bad tick does not let the instance spin down.
+  const maxAttempts = 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -111,6 +115,11 @@ async function ping(env) {
       });
       clearTimeout(timer);
       const body = (await resp.text()).slice(0, 200);
+      const retryable = resp.status === 429 || resp.status >= 500;
+      if (retryable && attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+        continue;
+      }
       return {
         ok: resp.ok,
         status: resp.status,
@@ -122,9 +131,10 @@ async function ping(env) {
     } catch (err) {
       clearTimeout(timer);
       const reason = err && err.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : String(err);
-      if (attempt === 2) {
+      if (attempt === maxAttempts) {
         return { ok: false, error: reason, at: new Date().toISOString() };
       }
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
     }
   }
   return { ok: false, error: 'unreachable', at: new Date().toISOString() };
@@ -164,6 +174,7 @@ export default {
         lastStatus: result.status ?? null,
         lastMs: result.ms ?? null,
         consecutiveFailures: result.ok ? 0 : (previous.consecutiveFailures || 0) + 1,
+        lastSuccessAt: result.ok ? result.at : previous.lastSuccessAt || null,
       };
       await env.STATUS.put(STATUS_KEY, JSON.stringify(next));
       return json(next, result.ok ? 200 : 502);

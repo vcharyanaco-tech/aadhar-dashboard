@@ -12,8 +12,10 @@ compatibility_date = "2026-08-04"
 [observability]
 enabled = true
 
-# Every 10 minutes, matching the cadence the dash-site worker uses for the Node
-# backend. The handler itself skips 21:00-06:00 IST.
+# Every 10 minutes, 24/7. The handler no longer skips 21:00-06:00 IST: waking a
+# hibernated instance is the path Render throttles, so the service now stays
+# warm around the clock in its dedicated workspace (~720-744h of the 750h
+# monthly free allowance).
 [triggers]
 crons = ["*/10 * * * *"]
 

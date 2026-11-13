@@ -272,9 +272,10 @@ after a period of inactivity.
 
 `kv_sync.py` removes the first problem: a dedicated Cloudflare Worker holds a
 copy in Workers KV, so a cold start or redeploy restores the database instead of
-losing it. The keep-alive that holds the instance awake during the working day is the
+losing it. The keep-alive that holds the instance awake is the
 `aadhar-keepalive` Worker in this same repository (see below). The dash-site
-cron only knows about the Node backend, so it does not cover this service.
+cron only knows about the Node backend and still sleeps overnight, so it does
+not cover this service.
 
 This needs the bridge to be configured (`AADHAR_SYNC_URL` and
 `AADHAR_SYNC_TOKEN`); without it the service loses its data on every deploy. The
@@ -390,14 +391,30 @@ so a cron pings this service's health endpoint every 10 minutes.
 | Secret | `AADHAR_ORIGIN` (the Render URL; must be set, or every tick no-ops) |
 | KV namespace | `aadhar-keepalive-status` |
 
-It skips 21:00-06:00 IST so the instance sleeps overnight and banks instance-hours
-against Render's monthly free cap; the first user of the day pays a cold start.
+It runs **24/7**. The cron used to skip 21:00-06:00 IST and let the instance
+sleep, which put it on Render's hibernation wake path every morning. On 12-13
+November 2026 Render's edge refused that wake for more than a day, answering
+every request with `429` and `x-render-routing: hibernate-rate-limited`, so the
+dashboard was unreachable even though the cron was running. Keeping the instance
+warm avoids the wake path entirely.
+
+The service is in its own Render workspace, so 24/7 uses ~720 instance-hours in
+a 30-day month and ~744 in a 31-day month, against the workspace's 750-hour free
+allowance. It intentionally does not share that workspace with `dash-site`.
+
+**A 429 is never retried.** It is not a transient error: retrying adds pressure
+that can extend Render's block. The Worker records the response and backs off for
+30 minutes, then 60, skipping cron ticks until the deadline. `/status` shows
+`throttled: true`, `throttledUntil` and `lastThrottledAt` while that is in
+effect. Only 5xx and transport failures are retried, briefly, because those can
+be a cold start or a deploy.
 
 Unlike the dash-site cron, this one **records its outcome**. The old cron had no
 observable state, so "the cron is working" and "the cron is pointed at the wrong
 URL" looked identical. `/status` reports `configured: false` and
 `healthy: false` when the origin is unset, so a misconfiguration is visible in
-seconds rather than after someone complains about a slow morning.
+seconds rather than after someone complains about a slow morning. `ticksToday`
+resets at midnight IST (`ticksDate` records which day it belongs to).
 
 Configure it with:
 

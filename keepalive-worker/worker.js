@@ -21,11 +21,14 @@
  *
  * DO NOT RETRY 429
  *
- * A 429 from Render's edge is not a transient error. Retrying it used to
- * amplify the pressure that caused the block and could extend it. This Worker
- * records the 429 on the first response and then backs off (30 minutes, then
- * 60) instead of pinging again. Only 5xx and transport errors are retried, and
- * only briefly, because those can be a cold start or a redeploy.
+ * A 429 from Render's edge is not a transient error. Retrying it in a burst
+ * used to amplify the pressure that caused the block and could extend it. This
+ * Worker records the 429 on the first response and then backs off (5 minutes,
+ * then 10) instead of pinging again. The 10-minute cap is deliberate: a
+ * hibernated free instance re-hibernates after 15 minutes, so a 30/60-minute
+ * backoff guarantees every probe is another refused wake and turns one 429 into
+ * an hour-long outage. Only 5xx and transport errors are retried in a burst,
+ * because those can be a cold start or a redeploy.
  *
  * The dash-site Worker has an equivalent cron, but it only pings the Node
  * backend at SERVER_ORIGIN and still sleeps overnight. It intentionally does
@@ -45,10 +48,13 @@ const MAX_STATUS_AGE_MS = 30 * 60 * 1000; // two missed 10-minute ticks
 
 const DEFAULTS = { timeoutMs: 20000, path: '/aadhar-dashboard/_stcore/health' };
 
-// Back off for 30 minutes after the first 429, then an hour. Long enough to
-// stop adding pressure to Render's edge, short enough to notice recovery.
-const THROTTLE_BASE_MS = 30 * 60 * 1000;
-const THROTTLE_MAX_MS = 60 * 60 * 1000;
+// Back off for 5 minutes after the first 429, then cap at 10. Keep this below
+// the 15-minute idle window: if the backoff outlives the window, the instance
+// is already hibernated again when the next probe runs, so every probe is a
+// refused wake and the block never gets a chance to clear. One probe per tick
+// is still not a retry burst.
+const THROTTLE_BASE_MS = 5 * 60 * 1000;
+const THROTTLE_MAX_MS = 10 * 60 * 1000;
 
 // 5xx and transport failures get a couple of quick attempts: those can be a
 // cold start or a deploy. 429 never retries (see the header comment).

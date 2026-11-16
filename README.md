@@ -429,25 +429,27 @@ npx wrangler deploy
 curl https://aadhar-keepalive.aadhar-haryana.workers.dev/status
 ```
 
-#### External keep-alive and alert
+#### External keep-alives and alert
 
 The Worker egresses from Cloudflare. When Render's wake limiter blocks that
 path, no amount of Cloudflare-sourced pings can wake the instance — on 15-16
 November 2026 the cron probed for 23 hours and every wake was refused until a
-request from a different network broke the block. `.github/workflows/aadhar-keepalive.yml`
-is that different network: it runs every 5 minutes (GitHub's minimum interval)
-from GitHub Actions, hits the health endpoint directly, and retries three times
-with a 45-second gap to cover the ~1-minute cold start. A failed run is the
-outage alert — GitHub emails the repo owner; the Worker itself can only record
-state, it cannot send anything.
+request from a different network broke the block.
 
-GitHub schedules are best-effort and can be delayed under load, and scheduled
-workflows in public repos are disabled after 60 days without repository
-activity (a push re-enables them). The Worker remains the primary keep-alive.
-If the GitHub path is unavailable, any external monitor pointed at
-`https://aadhar-dashboard-9ljo.onrender.com/aadhar-dashboard/_stcore/health`
-(UptimeRobot at 5 minutes, cron-job.org at 1 minute) provides the same
-independent recovery path.
+The reliable external path is a **cron-job.org** job (id `8876065`, every 5
+minutes): `GET https://aadhar-dashboard-9ljo.onrender.com/aadhar-dashboard/_stcore/health`,
+60-second timeout, browser User-Agent, email on two consecutive failures and on
+recovery. The API key lives in the cron-job.org console, never in this repo.
+UptimeRobot at 5 minutes (or any equivalent monitor) is a drop-in replacement.
+
+`.github/workflows/aadhar-keepalive.yml` is a **secondary** path. It performs
+the same check and also records the Worker's `/status`; a failed run emails the
+repo owner. GitHub does not honour `*/5` on this account — measured on
+16 November 2026, the existing `rea-render` `*/5` keep-alive ran about 4-6 times
+per day, and `dash-site`'s daily 02:00 UTC check ran hours late — so treat it as
+best-effort, not as the 5-minute keep-alive. `workflow_dispatch` makes it useful
+for an on-demand check, and scheduled workflows in public repos are disabled
+after 60 days without repository activity (a push re-enables them).
 
 ## Targets and achievement
 

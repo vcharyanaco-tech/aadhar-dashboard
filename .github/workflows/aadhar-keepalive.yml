@@ -10,9 +10,13 @@
 # which is the outage alert (GitHub emails the repo owner/watchers); the Worker
 # itself can only record state, it cannot send an alert.
 #
-# 5 minutes is GitHub's minimum schedule interval. Scheduled runs are
-# best-effort and can be delayed under load; that is acceptable for a recovery
-# path because the Worker probes every 10 minutes in parallel.
+# 5 minutes is GitHub's minimum schedule interval, but GitHub does not honour
+# that cadence for this account: the rea-render repo's `*/5` keep-alive runs
+# about 4-6 times per day, and dash-site's daily 02:00 UTC check runs hours
+# late. Treat this workflow as a secondary recovery/alert path only. The
+# reliable external keep-alive is a cron-job.org job (every 5 minutes) hitting
+# the same health URL, created 2026-11-16 (job id 8876065; the API key lives in
+# the cron-job.org console, never in this repo).
 #
 # NOTE: scheduled workflows in public repos are disabled after 60 days without
 # repository activity. Any push re-enables them; check the Actions tab if the

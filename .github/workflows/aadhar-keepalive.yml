@@ -1,0 +1,77 @@
+# External, non-Cloudflare keep-alive for the Aadhaar dashboard.
+#
+# The primary keep-alive is the aadhar-keepalive Worker (cron every 10
+# minutes). It egresses from Cloudflare, and Render's hibernate wake limiter can
+# refuse wake-ups from that path for hours at a time — the dashboard then shows
+# "The Aadhaar dashboard is waking up" even though the Worker is running. This
+# workflow is the independent recovery path: GitHub Actions egress is not
+# Cloudflare, so it can wake the instance while Cloudflare-sourced wake attempts
+# are being refused. It also fails the run when the origin does not come back,
+# which is the outage alert (GitHub emails the repo owner/watchers); the Worker
+# itself can only record state, it cannot send an alert.
+#
+# 5 minutes is GitHub's minimum schedule interval. Scheduled runs are
+# best-effort and can be delayed under load; that is acceptable for a recovery
+# path because the Worker probes every 10 minutes in parallel.
+#
+# NOTE: scheduled workflows in public repos are disabled after 60 days without
+# repository activity. Any push re-enables them; check the Actions tab if the
+# external keep-alive disappears from the schedule.
+
+name: aadhar-keepalive-external
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: aadhar-keepalive-external
+  cancel-in-progress: false
+
+env:
+  AADHAR_ORIGIN: https://aadhar-dashboard-9ljo.onrender.com
+  AADHAR_HEALTH_PATH: /aadhar-dashboard/_stcore/health
+  KEEPALIVE_STATUS_URL: https://aadhar-keepalive.aadhar-haryana.workers.dev/status
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Wake and verify the Render origin
+        run: |
+          set -uo pipefail
+          url="${AADHAR_ORIGIN}${AADHAR_HEALTH_PATH}"
+          ok=false
+          for attempt in 1 2 3; do
+            code=$(curl -sS -o /tmp/health -w '%{http_code}' --max-time 60 "$url" || true)
+            body=$(head -c 120 /tmp/health 2>/dev/null || true)
+            echo "attempt ${attempt}/3: HTTP ${code} ${body}"
+            if [ "$code" = "200" ]; then
+              ok=true
+              break
+            fi
+            # A cold start takes 30-60s; give it time before the next attempt.
+            [ "$attempt" -lt 3 ] && sleep 45
+          done
+          if [ "$ok" != "true" ]; then
+            echo "::error::Aadhaar origin did not return 200 after 3 attempts"
+            exit 1
+          fi
+
+      - name: Report keep-alive state
+        if: always()
+        run: |
+          set -uo pipefail
+          body=$(curl -sS --max-time 30 "$KEEPALIVE_STATUS_URL" || true)
+          echo "$body"
+          if [ -n "$body" ]; then
+            printf '%s' "$body" | jq -r '
+              "healthy=\(.healthy) lastOk=\(.lastOk) lastStatus=\(.lastStatus) " +
+              "consecutiveFailures=\(.consecutiveFailures) lastSuccessAt=\(.lastSuccessAt) " +
+              "throttledUntil=\(.throttledUntil)"
+            ' || true
+          fi

@@ -2394,10 +2394,64 @@ def report_tab():
         st.download_button("Download Not Working Stations CSV", nw.to_csv(index=False).encode("utf-8-sig"),
                            "haryana_circle_not_working_stations.csv", "text/csv", key="dl_not_working")
 
+    low_txn_station_reports(agg, miss_sel, ids)
+
     # Admin-only: Centres vs Camps bifurcation in the circle-wise weekly report format.
     if is_admin():
         st.divider()
         circle_weekly_report_admin(agg_full, ids)
+
+
+def low_txn_station_reports(agg, missing, ids):
+    """Station IDs whose transactions over the selected period are below 10 / between 10 and 20.
+
+    The period is whatever the Report tab selected: one day gives that day's
+    figures, several days give each station's total across those days (agg is
+    already summed per station over `ids`, with station changes and transfers
+    applied). Bands match Operator Analysis: fewer than 10, and 10 to 20 inclusive.
+    """
+    st.divider()
+    st.subheader("Low transaction Station IDs")
+    n_days = len(ids)
+    st.caption("Station IDs with fewer than 10 transactions, and with 10 to 20 transactions (both included). "
+               + ("Figures are for the single selected day. " if n_days == 1 else
+                  f"Figures are each station's total over the {n_days} selected days. ")
+               + "Follows the Division filter above.")
+    inc0 = st.checkbox("Also include station IDs with 0 transactions / no data in the period",
+                       value=False, key="rep_low_inc0")
+
+    cols = ["key", "station", "office_id", "division", "sub_division", "total"]
+    df = agg[cols].copy()
+    if inc0 and len(missing):
+        miss = missing[["key", "station", "office_id", "division", "sub_division"]].assign(total=0)
+        df = pd.concat([df, miss], ignore_index=True)
+    df["total"] = pd.to_numeric(df["total"], errors="coerce").fillna(0).astype(int)
+    if not inc0:
+        df = df[df["total"] > 0]
+    df["sub_division"] = df["sub_division"].fillna("Not mapped").replace("", "Not mapped")
+    mach = machine_address_map(tuple(ids))
+    df["Machine Address"] = df["key"].map(lambda k: mach.get(k, ""))
+    df = df.rename(columns={"station": "Station ID", "office_id": "Office ID", "division": "Division",
+                            "sub_division": "Sub Division", "total": "Transactions"})
+    show_cols = ["Division", "Sub Division", "Station ID", "Office ID", "Machine Address", "Transactions"]
+    df = df.sort_values(["Division", "Sub Division", "Transactions", "Station ID"])[show_cols]
+
+    t1, t2 = st.tabs(["Less than 10", "10 to 20"])
+    for tab, sub, name, key in ((t1, df[df["Transactions"] < 10], "less_than_10", "lt10"),
+                                (t2, df[(df["Transactions"] >= 10) & (df["Transactions"] <= 20)],
+                                 "10_to_20", "b1020")):
+        with tab:
+            st.caption(f"{len(sub):,} station ID(s).")
+            if sub.empty:
+                st.info("No station IDs in this band for the selected period.")
+                continue
+            st.dataframe(sub, hide_index=True, use_container_width=True)
+            c1, c2 = st.columns(2)
+            c1.download_button("Download CSV", sub.to_csv(index=False).encode("utf-8-sig"),
+                               f"stations_txn_{name}.csv", "text/csv", key=f"rep_{key}_csv")
+            with c2:
+                excel_download(sub, name[:31], f"stations_txn_{name}.xlsx", "Download Excel",
+                               bold_last_row=False)
 
 
 # ---------------------------------------------------------------- admin: circle weekly report

@@ -1,0 +1,54 @@
+# Test suite for the Aadhaar dashboard.
+#
+# Render redeploys main on every commit (render.yaml, autoDeployTrigger: commit),
+# so a parser change that orphans history or a broken aggregation rule reaches
+# production before a human looks at it. This workflow is the gate: it runs the
+# same suite the README documents, on the same Python version Render runs.
+#
+# Python 3.14 matches PYTHON_VERSION in render.yaml. Every pin in
+# requirements.txt has a 3.14 wheel, so there is deliberately no fallback
+# interpreter: if that ever stops being true the install fails loudly instead of
+# the suite passing on a version production does not use.
+#
+# tests/test_screens.py drives app.py through Streamlit's AppTest. Its optional
+# export check shells out to node and skips when node is absent; ubuntu-latest
+# ships node, so it runs here.
+#
+# The keep-alive workflow is separate (.github/workflows/aadhar-keepalive.yml);
+# it is infrastructure, not a check on this code.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest==9.2.0
+
+      - name: Run the test suite
+        run: python -m pytest tests -q

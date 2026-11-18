@@ -402,12 +402,16 @@ The service is in its own Render workspace, so 24/7 uses ~720 instance-hours in
 a 30-day month and ~744 in a 31-day month, against the workspace's 750-hour free
 allowance. It intentionally does not share that workspace with `dash-site`.
 
-**A 429 is never retried.** It is not a transient error: retrying adds pressure
-that can extend Render's block. The Worker records the response and backs off for
-30 minutes, then 60, skipping cron ticks until the deadline. `/status` shows
-`throttled: true`, `throttledUntil` and `lastThrottledAt` while that is in
-effect. Only 5xx and transport failures are retried, briefly, because those can
-be a cold start or a deploy.
+**A 429 is never retried in a burst.** It is not a transient error: hammering
+it adds pressure that can extend Render's block. The Worker records the response
+and backs off for 5 minutes, then 10, skipping cron ticks until the deadline.
+The cap is deliberately below the 15-minute idle window: if the backoff outlives
+that window, the instance is already hibernated again when the next probe runs,
+so every probe is a refused wake. The old 30/60-minute backoff did exactly that
+and turned a single 429 into an hour-long outage. `/status` shows
+`throttled: true`, `throttledUntil` and `lastThrottledAt` while the backoff is in
+effect. Only 5xx and transport failures are retried in a burst, because those
+can be a cold start or a deploy.
 
 Unlike the dash-site cron, this one **records its outcome**. The old cron had no
 observable state, so "the cron is working" and "the cron is pointed at the wrong
@@ -424,6 +428,28 @@ npx wrangler secret put AADHAR_ORIGIN   # the service's https://<name>.onrender.
 npx wrangler deploy
 curl https://aadhar-keepalive.aadhar-haryana.workers.dev/status
 ```
+
+#### External keep-alives and alert
+
+The Worker egresses from Cloudflare. When Render's wake limiter blocks that
+path, no amount of Cloudflare-sourced pings can wake the instance — on 15-16
+November 2026 the cron probed for 23 hours and every wake was refused until a
+request from a different network broke the block.
+
+The reliable external path is a **cron-job.org** job (id `8876065`, every 5
+minutes): `GET https://aadhar-dashboard-9ljo.onrender.com/aadhar-dashboard/_stcore/health`,
+60-second timeout, browser User-Agent, email on two consecutive failures and on
+recovery. The API key lives in the cron-job.org console, never in this repo.
+UptimeRobot at 5 minutes (or any equivalent monitor) is a drop-in replacement.
+
+`.github/workflows/aadhar-keepalive.yml` is a **secondary** path. It performs
+the same check and also records the Worker's `/status`; a failed run emails the
+repo owner. GitHub does not honour `*/5` on this account — measured on
+16 November 2026, the existing `rea-render` `*/5` keep-alive ran about 4-6 times
+per day, and `dash-site`'s daily 02:00 UTC check ran hours late — so treat it as
+best-effort, not as the 5-minute keep-alive. `workflow_dispatch` makes it useful
+for an on-demand check, and scheduled workflows in public repos are disabled
+after 60 days without repository activity (a push re-enables them).
 
 ## Targets and achievement
 
